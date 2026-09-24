@@ -26,6 +26,7 @@ function makeMockCloud() {
       if (k === '$or') return v.some((sub) => matches(doc, sub));
       const actual = k === '_id' ? doc._id : doc[k];
       if (v && v.__isRegExp) return new RegExp(v.regexp, v.options).test(String(actual ?? ''));
+      if (v && v.__in) return v.__in.includes(actual);
       return actual === v;
     });
   };
@@ -51,10 +52,31 @@ function makeMockCloud() {
           return { data: rows.map((d) => ({ ...d })) };
         },
         count: async () => ({ total: docs.filter((d) => matches(d, where)).length }),
+        remove: async () => {
+          // 批量按条件删除（云开发 where().remove()）
+          const keep = [];
+          let removed = 0;
+          for (const d of docs) {
+            if (matches(d, where)) removed++;
+            else keep.push(d);
+          }
+          docs.length = 0;
+          docs.push(...keep);
+          return { stats: { removed } };
+        },
         add: async ({ data }) => {
+          // 真实云开发支持 add({data: [...]}) 批量插入（≤100 条/次），返回含 idList
+          if (Array.isArray(data)) {
+            const idList = data.map((d) => {
+              const _id = `mock_${++addCounter}`;
+              docs.push({ _id, ...d });
+              return _id;
+            });
+            return { _id: idList[0], idList };
+          }
           const _id = `mock_${++addCounter}`;
           docs.push({ _id, ...data });
-          return { _id };
+          return { _id }
         },
         doc: (id) => ({
           get: async () => {
@@ -90,6 +112,7 @@ function makeMockCloud() {
         aggregate: {},
         or: (arr) => ({ $or: arr }),
         and: (arr) => ({ $and: arr }),
+        in: (arr) => ({ __in: Array.isArray(arr) ? arr : [arr] }),
       },
       serverDate: () => new Date().toISOString(),
       RegExp: ({ regexp, options }) => ({ __isRegExp: true, regexp, options }),
@@ -306,17 +329,17 @@ async function run() {
       first.data.processed === Math.min(first.data.datasetCount, 150) &&
       first.data.remaining === Math.max(0, first.data.datasetCount - 150),
       { processed: first.data.processed, remaining: first.data.remaining, datasetCount: first.data.datasetCount });
-    // full 模式（372 条）走多批次路径：首批必有 remaining，循环推进直到 done
-    let res = await sCall({ action: 'sync', mode: 'full', limit: 150 });
-    check('full 模式分批生效（372>150 时 remaining>0）',
-      res.data.processed === 150 && res.data.remaining > 0 && res.data.nextOffset === 150,
+    // full 模式（372 条）走多批次路径：单批上限 100，共 4 批
+    let res = await sCall({ action: 'sync', mode: 'full', limit: 100 });
+    check('full 模式分批生效（372>100 时 remaining>0）',
+      res.data.processed === 100 && res.data.remaining > 0 && res.data.nextOffset === 100,
       { processed: res.data.processed, remaining: res.data.remaining });
     let guard = 0;
     while (!res.data.done && guard++ < 20) {
-      res = await sCall({ action: 'sync', mode: 'full', offset: res.data.nextOffset, limit: 150 });
+      res = await sCall({ action: 'sync', mode: 'full', offset: res.data.nextOffset, limit: 100 });
       if (!res.success) break;
     }
-    check('分批循环至 done（共 3 批）', res.data.done === true && res.data.remaining === 0 && guard === 2, { guard, done: res.data.done });
+    check('分批循环至 done（共 4 批）', res.data.done === true && res.data.remaining === 0 && guard === 3, { guard, done: res.data.done });
     check('同步全部成功写入（无 failed）', res.data.failed === 0, res.data.failures);
     const totalInserted = await (async () => {
       const st = await sCall({ action: 'status' });

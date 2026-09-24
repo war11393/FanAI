@@ -52,19 +52,37 @@ try {
 
 /* 4. 通过开发者工具 CLI 部署云函数 */
 console.log(`\n[deploy] 部署云函数 ${FN_NAME} 到环境 ${ENV_ID} …`);
-try {
-  run(`"${CLI}" cloud functions deploy --env ${ENV_ID} --names ${FN_NAME} --remote-npm-install --project "${ROOT}"`);
-} catch (e) {
-  console.error('[deploy] CLI 部署失败。常见原因：开发者工具未打开或未开启服务端口。');
-  console.error('        可改为手动部署：开发者工具右键 cloudfunctions/recipe-sync → 上传并部署（云端安装依赖）');
-  process.exit(1);
+// 云侧对新创建/刚更新的函数有短暂「Creating 状态」互斥窗口，报
+// FailedOperation.UpdateFunctionCode 时等待重试即可（实测 ~20s 后成功）
+const deployCmd = `"${CLI}" cloud functions deploy --env ${ENV_ID} --names ${FN_NAME} --remote-npm-install --project "${ROOT}"`;
+let deployed = false;
+for (let attempt = 1; attempt <= 4 && !deployed; attempt++) {
+  try {
+    run(deployCmd);
+    deployed = true;
+  } catch (e) {
+    if (attempt < 4) {
+      console.log(`[deploy] 第 ${attempt} 次部署失败（多为函数处于 Creating 状态的瞬时冲突），20s 后重试…`);
+      execSync('ping -n 21 127.0.0.1 >nul', { shell: 'cmd.exe', stdio: 'ignore' });
+      continue;
+    }
+    console.error('[deploy] CLI 部署失败。常见原因：开发者工具未打开或未开启服务端口。');
+    console.error('        可改为手动部署：开发者工具右键 cloudfunctions/recipe-sync → 上传并部署（云端安装依赖）');
+    process.exit(1);
+  }
 }
 
 /* 5. 给出云端测试直达链接（CLI 无 invoke 能力，触发同步的 payload 已备好） */
-const event = JSON.stringify({ action: 'sync', mode, prune });
+// 首次入库建议 full；日常增量用 changed。单批上限 100（云开发批量 add 上限 +
+// 函数 3s 超时），按响应 nextOffset 续传至 done。推荐直接跑：
+//   node scripts/invoke-recipes-sync.js（经 cli auto 自动分批循环，免手工）
+const event = JSON.stringify({ action: 'sync', mode, prune, limit: 80 });
 console.log('\n================ 最后一步：触发云端同步 ================');
 console.log(`云开发控制台 → 云函数 → ${FN_NAME} → 云端测试，传入：`);
 console.log(`  ${event}`);
+console.log('（或开发者工具调试器 Console 粘贴：');
+console.log(`  wx.cloud.callFunction({name:'${FN_NAME}',data:${event}}).then(r=>console.log(r.result))`);
+console.log(' ）');
 try {
   execSync(`start "" "https://tcb.cloud.tencent.com/dev?envId=${ENV_ID}#/function/detail?id=${FN_NAME}"`, { stdio: 'ignore', shell: 'cmd.exe' });
   console.log('[deploy] 已尝试在浏览器打开云开发控制台函数页');

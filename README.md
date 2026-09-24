@@ -142,7 +142,8 @@ data/recipes/manifest.json           来源 commit / 统计 / 增删摘要
 ```
 
 - **增量拉取**：fetch 脚本对比上次数据的 `contentHash`，自动产出 `changed` 子集与 `removedSlugs` 清单
-- **云端同步**：云开发控制台「云端测试」传 `{"action":"sync","mode":"changed"}`（增量）或 `mode=full`（全量对账）；单次执行默认处理 150 条，响应里带 `nextOffset` 与 `hint`，按提示续传直到 `done:true`；`prune:true` 可清理上游已删除的菜谱
+- **云端同步**：`node scripts/invoke-recipes-sync.js [--mode changed|full]`（经开发者工具 `cli auto` 自动化端口自动分批，单批 80 条，直到 `done:true`）；也可在云开发控制台「云端测试」传 `{"action":"sync","mode":"full","offset":0,"limit":80}` 按响应 `nextOffset` 手工续传；`prune:true` 可清理上游已删除的菜谱
+- **★ 数据文件平铺**：部署数据副本以 `recipe-data.*.json` 放在函数根目录（Windows CLI 打包子目录会产出云端 Linux 读不到的反斜杠 zip 条目）
 - **上游有新菜谱时**：重跑 `pnpm recipes:deploy`，按提示触发一次云端测试即完成同步，全程无需手工改数据
 
 ## 📄 License

@@ -10,7 +10,7 @@
  *   data/recipes/howtocook.json         全量结构化菜谱（入库、可提交 git）
  *   data/recipes/howtocook.changed.json 相对上次拉取的新增/变更子集（增量同步用）
  *   data/recipes/manifest.json          来源 commit、时间、统计、增删摘要
- *   cloudfunctions/recipe-sync/data/    部署副本（云函数打包用，不提交 git）
+ *   cloudfunctions/recipe-sync/data/    部署副本（★必须入库：微信云函数打包遵循 gitignore）
  *
  * 【用法】
  *   node scripts/fetch-recipes.js            完整流程：克隆/更新仓库 → 解析 → 写数据
@@ -30,7 +30,18 @@ const REPO_DIR = path.join(ROOT, 'data', 'howtocook');
 const REPO_URL = 'https://github.com/Anduin2017/HowToCook.git';
 const REPO_BRANCH = 'master';
 const OUT_DIR = path.join(ROOT, 'data', 'recipes');
-const FN_DATA_DIR = path.join(ROOT, 'cloudfunctions', 'recipe-sync', 'data');
+const FN_DIR = path.join(ROOT, 'cloudfunctions', 'recipe-sync');
+/**
+ * ★ 部署副本必须放函数根目录、不能放子目录：
+ *   微信开发者工具 CLI 在 Windows 打包云函数时，子目录会以反斜杠写进 zip
+ *   （`data\x.json`），云端 Linux 解出来是带字面 `\` 的平铺文件名，
+ *   `data/` 子目录根本不存在（真实故障：云端报「缺少数据文件」）。
+ */
+const FN_FILES = {
+  'howtocook.json': 'recipe-data.full.json',
+  'howtocook.changed.json': 'recipe-data.changed.json',
+  'manifest.json': 'recipe-data.manifest.json',
+};
 const DATA_FILE = path.join(OUT_DIR, 'howtocook.json');
 const CHANGED_FILE = path.join(OUT_DIR, 'howtocook.changed.json');
 const MANIFEST_FILE = path.join(OUT_DIR, 'manifest.json');
@@ -332,14 +343,10 @@ function main() {
   };
   fs.writeFileSync(MANIFEST_FILE, JSON.stringify(manifest, null, 2));
 
-  // 同步到云函数部署目录（.gitignore 已排除，云端打包时带上数据）
-  fs.mkdirSync(FN_DATA_DIR, { recursive: true });
-  for (const [src, dst] of [
-    [DATA_FILE, path.join(FN_DATA_DIR, 'howtocook.json')],
-    [CHANGED_FILE, path.join(FN_DATA_DIR, 'howtocook.changed.json')],
-    [MANIFEST_FILE, path.join(FN_DATA_DIR, 'manifest.json')],
-  ]) {
-    fs.copyFileSync(src, dst);
+  // 同步到云函数部署目录（★平铺在函数根目录：CLI 在 Windows 打包子目录会写出
+  // `data\x.json` 这种反斜杠 zip 条目，云端 Linux 解不出子目录——真实故障）
+  for (const [src, dst] of Object.entries(FN_FILES)) {
+    fs.copyFileSync(path.join(OUT_DIR, src), path.join(FN_DIR, dst));
   }
 
   console.log(`[fetch] 解析成功 ${recipes.length} / ${files.length}（失败 ${failures.length}）`);
@@ -347,7 +354,7 @@ function main() {
   console.log(`[fetch] 增量：新增 ${newAdded.length}，变更 ${newUpdated.length}，未变 ${unchanged}，移除 ${removed.length}`);
   console.log('[fetch] 分类统计：', JSON.stringify(byCategory));
   console.log(`[fetch] 产出：${path.relative(ROOT, DATA_FILE)} / ${path.relative(ROOT, CHANGED_FILE)} / ${path.relative(ROOT, MANIFEST_FILE)}`);
-  console.log('[fetch] 已复制部署副本到 cloudfunctions/recipe-sync/data/');
+  console.log('[fetch] 已平铺复制部署副本到 cloudfunctions/recipe-sync/recipe-data.*.json');
 }
 
 main();
