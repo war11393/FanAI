@@ -1,0 +1,9 @@
+{
+  "name": "recipe",
+  "version": "1.0.0",
+  "description": "今天吃什么 - 菜谱与餐饮计划",
+  "main": "index.js",
+  "dependencies": {
+    "wx-server-sdk": "~3.0.5-beta.1"
+  }
+}

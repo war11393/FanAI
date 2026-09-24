@@ -1,0 +1,9 @@
+{
+  "name": "ai-text",
+  "version": "1.0.0",
+  "description": "今天吃什么 - 文本/视觉 AI 能力（混元 hy3）",
+  "main": "index.js",
+  "dependencies": {
+    "wx-server-sdk": "~3.0.5-beta.1"
+  }
+}

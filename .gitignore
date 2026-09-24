@@ -2,6 +2,13 @@
 node_modules/
 .pnpm-store/
 
+# 云函数依赖：本地安装仅供开发者工具「上传并部署：云端安装依赖」使用，不入库
+cloudfunctions/*/node_modules/
+
+# HowToCook 上游克隆缓存（217MB，仅作为拉取缓存，可由脚本重新克隆）；同步部署用的数据副本也不入库
+data/howtocook/
+cloudfunctions/recipe-sync/data/
+
 # Production
 dist/
 build/

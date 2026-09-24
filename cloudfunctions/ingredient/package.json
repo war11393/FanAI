@@ -1,0 +1,9 @@
+{
+  "name": "ingredient",
+  "version": "1.0.0",
+  "description": "今天吃什么 - 食材库存 CRUD 与新鲜度状态机",
+  "main": "index.js",
+  "dependencies": {
+    "wx-server-sdk": "~3.0.5-beta.1"
+  }
+}

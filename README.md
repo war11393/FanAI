@@ -118,6 +118,33 @@ AI 全部调用失败时后端返回内置的离线兜底菜单，保证核心�
 - 开发规范（pnpm、命名、组件库、跨端兼容）见 [AGENTS.md](./AGENTS.md)
 - 界面设计规范见 [DESIGN.md](./DESIGN.md)
 
+## 📚 数据来源（第三方开源引用）
+
+本项目的公共菜谱库引用自开源项目 **[HowToCook](https://github.com/Anduin2017/HowToCook)**（程序员做饭指南）：
+
+- **许可证**：[Unlicense](https://github.com/Anduin2017/HowToCook/blob/master/LICENSE)（公有领域，可自由使用与商用）
+- **版权**：菜谱内容归 HowToCook 原作者及贡献者所有，本项目仅做结构化转换
+- **同步方式**：`scripts/fetch-recipes.js` 拉取上游仓库并解析为结构化数据（`data/recipes/`），经 `recipe-sync` 云函数幂等入库；每条菜谱携带 `sourceUrl` 指向上游原文
+- **增量更新**：上游新增菜谱后执行 `pnpm recipes:deploy` 即可复用同一流程同步（详见下方「菜谱数据同步流水线」）
+
+## 🍳 菜谱数据同步流水线（可复用）
+
+```
+GitHub 仓库 (HowToCook)
+   │  ① pnpm recipes:fetch —— 克隆/更新 + 解析 markdown → 结构化 JSON
+   ▼
+data/recipes/howtocook.json          全量数据（入库持久化，提交 git）
+data/recipes/howtocook.changed.json  增量数据（新增/变更子集）
+data/recipes/manifest.json           来源 commit / 统计 / 增删摘要
+   │  ② pnpm recipes:deploy —— 分发公共代码 → 离线自检 → CLI 部署云函数
+   ▼
+微信云开发 recipes 集合               按 slug 幂等 upsert（openid=null 公共菜谱）
+```
+
+- **增量拉取**：fetch 脚本对比上次数据的 `contentHash`，自动产出 `changed` 子集与 `removedSlugs` 清单
+- **云端同步**：云开发控制台「云端测试」传 `{"action":"sync","mode":"changed"}`（增量）或 `mode=full`（全量对账）；单次执行默认处理 150 条，响应里带 `nextOffset` 与 `hint`，按提示续传直到 `done:true`；`prune:true` 可清理上游已删除的菜谱
+- **上游有新菜谱时**：重跑 `pnpm recipes:deploy`，按提示触发一次云端测试即完成同步，全程无需手工改数据
+
 ## 📄 License
 
 [MIT](./LICENSE)

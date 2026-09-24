@@ -1,0 +1,9 @@
+{
+  "name": "recipe-sync",
+  "version": "1.0.0",
+  "description": "今天吃什么 - 开源菜谱库（HowToCook）同步云函数：幂等 upsert 公共菜谱到 recipes 集合",
+  "main": "index.js",
+  "dependencies": {
+    "wx-server-sdk": "~3.0.5-beta.1"
+  }
+}
