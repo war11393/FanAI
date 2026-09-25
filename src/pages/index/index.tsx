@@ -1,14 +1,16 @@
 import { useEffect, useState } from 'react';
-import Taro from '@tarojs/taro';
+import Taro, { useDidShow, useDidHide } from '@tarojs/taro';
 import { View, Text } from '@tarojs/components';
 import {
   getUserProfile,
   listIngredients,
   aiRecommend,
-  type UserProfile,
+  listRecentDishes,
+  matchRecipesByIngredients,
   type Ingredient,
   type AiDish,
 } from '@/cloud/api';
+import { useProfileStore } from '@/store/profile';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog';
@@ -17,7 +19,9 @@ import { Sparkles, UserPlus, RefreshCw, Check } from 'lucide-react-taro';
 type Dish = AiDish;
 
 export default function IndexPage() {
-  const [profile, setProfile] = useState<UserProfile | null>(null);
+  // ★ C1：人数等档案走全局 store（profile 页保存后实时同步）
+  const profile = useProfileStore((s) => s.profile);
+  const syncProfile = useProfileStore((s) => s.syncProfile);
   const [ingredients, setIngredients] = useState<Ingredient[]>([]);
   const [temporaryGuests, setTemporaryGuests] = useState(0);
   // 来且了弹窗
@@ -30,21 +34,39 @@ export default function IndexPage() {
   // 多选
   const [selected, setSelected] = useState<string[]>([]);
 
-  const loadHome = async () => {
+  // ★ 布局说明（勿改回绝对定位）：
+  //   本页是 tab 页，Taro/微信渲染层里页面可视区**已经排除了原生 TabBar**，
+  //   因此 `position: fixed; bottom: 0` 天然就落在 TabBar 上沿，
+  //   不需要任何 px 偏移量。此前用 bottom:50 / 动态算高度都是画蛇添足，
+  //   且 screenHeight-windowHeight 含状态栏，会导致按钮偏高。
+  //   安全区（全面屏底部横条）由 CSS env() 处理，同样不写死像素。
+
+  /** 拉取食材（档案由 store 负责，避免重复请求） */
+  const loadIngredients = async () => {
     try {
-      // ★ openid 由云函数从微信上下文获取，前端不再传
-      const [profileData, ingredientData] = await Promise.all([
-        getUserProfile(),
-        listIngredients(),
-      ]);
-      setProfile(profileData ?? null);
+      const ingredientData = await listIngredients();
       setIngredients(ingredientData.list ?? []);
     } catch (e) {
-      console.error('[index] loadHome error', e);
+      console.error('[index] loadIngredients error', e);
     }
   };
 
-  useEffect(() => { loadHome(); }, []);
+  /** 首次挂载：静默同步档案 + 拉食材 */
+  useEffect(() => {
+    syncProfile(getUserProfile);
+    loadIngredients();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  /**
+   * ★ C1 兜底：tab 页切回来时静默重拉
+   *   - 档案走 syncProfile（失败沿用全局旧值，不打断）
+   *   - 食材直接刷新（临期状态可能已变化）
+   */
+  useDidShow(() => {
+    syncProfile(getUserProfile);
+    loadIngredients();
+  });
 
   const regular = profile?.regularMembers ?? 2;
   const total = regular + temporaryGuests;
@@ -52,30 +74,60 @@ export default function IndexPage() {
   const expiredCount = ingredients.filter((i) => i.status === 'expired').length;
   const alertCount = expiringCount + expiredCount;
 
+  /**
+   * ★ 缺料汇总（仅供提示，不再承载补货入口）
+   *   补货已移到做菜页的备菜环节：那里菜品已确定，"缺什么"才是准的。
+   */
+  const hasMissing = dishes.some((d) => (d.missing_ingredients ?? []).length > 0);
+
   const handleRecommend = async (useGuests: number) => {
     setRecommending(true);
     setDishes([]);
     setSelected([]);
     Taro.showLoading({ title: 'AI 正在想今天的菜谱...' });
+    // ★ C2：用变量记录待提示文案，在 hideLoading **之后**再 showToast，
+    //   否则 showToast 会顶掉 loading、导致 hideLoading 报"未配对使用"
+    let toastMsg = '';
     try {
+      // ★ D2：先取近一周做过的菜（避开重复）；有食材时再取菜谱库候选（D1）
+      const ingNames = ingredients.map((i) => i.name);
+      const [recent, hints] = await Promise.all([
+        listRecentDishes(7).catch((e) => {
+          // 历史记录拉取失败不应阻断推荐
+          console.warn('[index] 近一周记录获取失败，推荐将不避开重复', e);
+          return { dishes: [] as string[] };
+        }),
+        ingNames.length > 0
+          ? matchRecipesByIngredients(ingNames, 12).catch((e) => {
+              console.warn('[index] 菜谱库匹配失败，推荐将不参考库内菜谱', e);
+              return { list: [] as Array<{ name: string }> };
+            })
+          : Promise.resolve({ list: [] as Array<{ name: string }> }),
+      ]);
+
+      const recipeHints = (hints.list ?? []).map((r) => r.name);
+
       const data = await aiRecommend({
         dinersCount: regular + useGuests,
-        ingredients: ingredients.map((i) => i.name),
+        ingredients: ingNames,
         stoves: profile?.stoves ?? [],
         allergies: profile?.allergies ?? [],
         taboos: profile?.taboos ?? [],
+        flavors: profile?.flavors ?? [],
+        recentDishes: recent.dishes ?? [],
+        recipeHints,
       });
       setDishes(data.dishes ?? []);
       setAiOffline(!!data.aiOffline);
-      if (data.aiOffline) {
-        Taro.showToast({ title: '智能推荐暂不可用，已展示备选菜谱', icon: 'none' });
-      }
+      if (data.aiOffline) toastMsg = '智能推荐暂不可用，已展示备选菜谱';
     } catch (e) {
+      // ★ B3 兜底：调用异常时明确提示「大模型繁忙」，并建议稍后再试
       console.error('[index] recommend error', e);
-      Taro.showToast({ title: '推荐失败，请重试', icon: 'none' });
+      toastMsg = '大模型繁忙，请稍后再试';
     } finally {
       Taro.hideLoading();
       setRecommending(false);
+      if (toastMsg) Taro.showToast({ title: toastMsg, icon: 'none', duration: 2500 });
     }
   };
 
@@ -103,12 +155,35 @@ export default function IndexPage() {
       dinersCount: total,
       dishes: selectedDishes,
       stoves: profile?.stoves ?? [],
+      // ★ E1：把现有食材名一并带过去，备菜/做菜环节能标出缺料
+      ingredients: ingredients.map((i) => i.name),
     });
     Taro.navigateTo({ url: '/pages/cook/index' });
   };
 
+  /** 重置推荐结果与选择（离开首页时调用） */
+  const resetRecommendState = () => {
+    setDishes([]);
+    setSelected([]);
+    setAiOffline(false);
+    setTemporaryGuests(0);
+  };
+
+  /**
+   * ★ 离开首页时清空推荐结果
+   *   本页是 tab 页不会卸载，状态会一直留着 —— 出餐回到首页会看到
+   *   上一轮的菜和选中项。useDidHide 在切走/跳转时触发，正好清干净。
+   */
+  useDidHide(() => {
+    resetRecommendState();
+  });
+
   return (
-    <View className="min-h-screen bg-[#FAF3E7] pb-32">
+    // ★ 根容器用 flex 纵向布局：让底部操作栏参与文档流（见下方 sticky 栏说明），
+    //   不写死高度/位置，适配各种竖屏比例
+    <View className="min-h-screen bg-[#FAF3E7] flex flex-col">
+      {/* 主内容区：flex-1 撑满剩余空间，底部栏自然被推到底部 */}
+      <View className="flex-1">
       {/* 顶部人数区 */}
       <View className="px-5 pt-6">
         <Card className="bg-[#FF8C42] rounded-3xl border-none shadow-lg">
@@ -198,6 +273,18 @@ export default function IndexPage() {
               <Text className="block text-xs text-[#B26A00]">智能推荐服务暂不可用，为你展示保证可做的家常菜</Text>
             </View>
           )}
+
+          {/* ★ 选菜阶段只做提示，不放补货入口：
+              此时还没确定最终选哪几道菜，算不出"为这桌菜到底缺什么"。
+              补货入口移到做菜页的备菜环节（那里菜品已确定）。 */}
+          {hasMissing && (
+            <View className="bg-[#FFF8E1] rounded-xl px-4 py-3 mb-4">
+              <Text className="block text-sm text-[#B26A00]">
+                部分菜需额外食材（已在下面对应菜上标出）。选好菜进入备菜环节可一键补货。
+              </Text>
+            </View>
+          )}
+
           <View className="flex flex-col gap-4">
             {dishes.map((dish, idx) => {
               const isSelected = selected.includes(dish.name);
@@ -224,11 +311,20 @@ export default function IndexPage() {
                     {dish.brief && <Text className="block text-sm text-gray-500 mb-2">{dish.brief}</Text>}
                     {dish.ingredients && dish.ingredients.length > 0 && (
                       <View className="flex flex-row flex-wrap gap-2 mb-3">
-                        {dish.ingredients.map((ig) => (
-                          <View key={ig} className="bg-[#FFF3E0] rounded-full px-3 py-1">
-                            <Text className="block text-xs text-[#B26A00]">{ig}</Text>
-                          </View>
-                        ))}
+                        {dish.ingredients.map((ig) => {
+                          // ★ D3：缺料在菜卡片内就地标出，信息就近
+                          const missing = (dish.missing_ingredients ?? []).includes(ig);
+                          return (
+                            <View
+                              key={ig}
+                              className={`rounded-full px-3 py-1 ${missing ? 'bg-[#FFE0E0]' : 'bg-[#FFF3E0]'}`}
+                            >
+                              <Text className={`block text-xs ${missing ? 'text-[#D14343]' : 'text-[#B26A00]'}`}>
+                                {missing ? `缺 ${ig}` : ig}
+                              </Text>
+                            </View>
+                          );
+                        })}
                       </View>
                     )}
                     <Button
@@ -246,25 +342,32 @@ export default function IndexPage() {
         </View>
       )}
 
-      {/* 底部操作栏（多选后进入做菜流程） */}
+      </View>
+      {/* ↑ 主内容区结束 */}
+
+      {/*
+        ★ 底部操作栏（多选后进入做菜流程）—— 纯流式，零绝对定位
+
+        为什么这样写（前几轮踩坑的结论）：
+        - 本页是 tab 页，页面可视区**已排除原生 TabBar**，所以任何 `bottom: N px`
+          的偏移都是多余的；写死值必然在别的机型/屏幕比例上错位。
+        - 这里改为**参与文档流**：内容区 `flex-1` 撑开，本栏自然被推到底部；
+          菜品多时它位于全部菜品之后（随滚动可见），不会被压住、也不遮内容。
+        - 安全区（全面屏底部条）交给 `env(safe-area-inset-bottom)`，不写死像素。
+        - 因此**不需要占位块**——占位块正是绝对定位的补丁。
+      */}
       {dishes.length > 0 && (
         <View
-          className="border-t border-gray-200"
-          style={{
-            position: 'fixed', left: 0, right: 0, bottom: 50,
-            display: 'flex', flexDirection: 'row', alignItems: 'center', gap: 12,
-            padding: '12px 16px', backgroundColor: '#fff', zIndex: 100,
-          }}
+          className="bg-white border-t border-gray-200 px-4 pt-3 z-50"
+          style={{ paddingBottom: 'calc(12px + env(safe-area-inset-bottom))' }}
         >
-          <View style={{ flex: 1 }}>
-            <Button
-              disabled={selected.length === 0}
-              className={`w-full rounded-full ${selected.length > 0 ? 'bg-[#FF8C42]' : ''}`}
-              onClick={startCooking}
-            >
-              开始做菜{selected.length > 0 ? `（${selected.length} 道）` : '（先选菜）'}
-            </Button>
-          </View>
+          <Button
+            disabled={selected.length === 0}
+            className={`w-full rounded-full ${selected.length > 0 ? 'bg-[#FF8C42]' : ''}`}
+            onClick={startCooking}
+          >
+            开始做菜{selected.length > 0 ? `（${selected.length} 道）` : '（先选菜）'}
+          </Button>
         </View>
       )}
 

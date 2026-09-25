@@ -1,6 +1,6 @@
 {
   "name": "today-eat-what",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "private": true,
   "description": "今天吃什么 - AI 驱动的家庭吃饭决策小程序（Taro + NestJS）",
   "scripts": {
@@ -19,6 +19,7 @@
     "init:db": "node scripts/init-database.js",
     "db:status": "node scripts/init-database.js --status",
     "devtools:auto": "node scripts/devtools-auto.js",
+    "ai:smoke": "node scripts/ai-smoke-test.js",
     "preinstall": "npx only-allow pnpm",
     "postinstall": "weapp-tw patch",
     "kill:all": "pkill -9 -f 'concurrently' 2>/dev/null || true; pkill -9 -f 'nest start' 2>/dev/null || true; pkill -9 -f 'taro build' 2>/dev/null || true; pkill -9 -f 'node.*dev' 2>/dev/null || true; echo 'All dev processes cleaned'",

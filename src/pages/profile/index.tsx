@@ -8,6 +8,7 @@ import { Card, CardContent } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Minus, Plus, UserRound, Refrigerator, ChefHat, AlarmSmoke } from 'lucide-react-taro';
 import { getUserProfile, saveUserProfile, type UserProfile } from '@/cloud/api';
+import { useProfileStore } from '@/store/profile';
 
 const STOVE_OPTIONS = ['燃气灶', '电磁炉', '电陶炉', '烤箱', '空气炸锅'];
 const POT_OPTIONS = ['炒锅', '汤锅', '平底锅', '蒸锅', '砂锅', '高压锅'];
@@ -21,6 +22,8 @@ const ProfilePage = () => {
   const [tabooInput, setTabooInput] = useState('');
   const [flavorInput, setFlavorInput] = useState('');
   const [saving, setSaving] = useState(false);
+  // ★ C1：写入全局 store，供首页实时同步
+  const setGlobalProfile = useProfileStore((s) => s.setProfile);
 
   const loadProfile = useCallback(async () => {
     try {
@@ -87,6 +90,7 @@ const ProfilePage = () => {
   const save = async () => {
     if (!profile) return;
     setSaving(true);
+    let toastMsg = '';
     try {
       const saved = await saveUserProfile({
         regularMembers: profile.regularMembers,
@@ -99,14 +103,23 @@ const ProfilePage = () => {
       });
       console.log('[profile] save res:', saved);
       setProfile(saved);
+      // ★ C1：同步写入全局 store，首页无需重新拉取即可显示新人数
+      setGlobalProfile(saved);
       // 语音开关单独持久化，供做菜阶段读取
       Taro.setStorageSync('voice_control_on', !!saved.voiceControlOn);
-      Taro.showToast({ title: '已保存', icon: 'success' });
+      toastMsg = '已保存';
     } catch (e) {
       console.error('[profile] save error', e);
-      Taro.showToast({ title: '保存失败', icon: 'none' });
+      toastMsg = '保存失败，请稍后再试';
     } finally {
       setSaving(false);
+      Taro.hideLoading();
+      if (toastMsg) {
+        Taro.showToast({
+          title: toastMsg,
+          icon: toastMsg === '已保存' ? 'success' : 'none',
+        });
+      }
     }
   };
 

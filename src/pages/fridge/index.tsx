@@ -1,5 +1,5 @@
 import { useEffect, useState, useCallback } from 'react';
-import Taro from '@tarojs/taro';
+import Taro, { useDidShow } from '@tarojs/taro';
 import { View, Text, ScrollView } from '@tarojs/components';
 import {
   listIngredients,
@@ -7,22 +7,56 @@ import {
   aiRecognizePhoto,
   batchAddIngredients,
   removeIngredient as removeIngredientApi,
-  uploadIngredientPhoto,
   type Ingredient,
 } from '@/cloud/api';
+import { readImageAsDataUrl } from '@/cloud';
 import { remainingDays } from '@/utils/shelf-life';
+import { UNIT_OPTIONS, guessUnit, guessQuantity } from '@/utils/units';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Card, CardContent } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog';
-import { Camera, Mic, PencilLine, Plus } from 'lucide-react-taro';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
+import { Camera, Mic, PencilLine, Plus, Trash2 } from 'lucide-react-taro';
 
 const STATUS_LABEL: Record<string, { text: string; color: string; chip: string }> = {
   fresh: { text: '新鲜', color: '#4CAF50', chip: 'bg-[#E8F5E9] text-[#4CAF50]' },
   expiring: { text: '临期', color: '#FFC107', chip: 'bg-[#FFF8E1] text-[#E6A700]' },
   expired: { text: '过期', color: '#F44336', chip: 'bg-[#FFEBEE] text-[#F44336]' },
 };
+
+/**
+ * 录入途径的可读文案
+ * ★ 同类项合并后 source 可能是「text+photo」这种组合（例如先文本录入"番茄"、
+ *   后拍照录入"西红柿"，两条合并为一条），需按组合展示而非只认单值。
+ */
+const SOURCE_LABEL: Record<string, string> = {
+  text: '文本',
+  photo: '拍照',
+  voice: '语音',
+};
+
+function formatSource(source?: string): string {
+  if (!source) return '文本';
+  const parts = String(source).split('+').filter(Boolean);
+  if (parts.length === 0) return '文本';
+  return parts.map((p) => SOURCE_LABEL[p] || '文本').join('+');
+}
+
+/** ★ 拍照识别后的待确认项（用户可改名称/数量/单位，或删除） */
+interface ReviewItem {
+  name: string;
+  quantity: number;
+  unit: string;
+  shelfLifeDays?: number;
+}
 
 export default function FridgePage() {
   const [list, setList] = useState<Ingredient[]>([]);
@@ -33,6 +67,10 @@ export default function FridgePage() {
   const [textOpen, setTextOpen] = useState(false);
   const [textVal, setTextVal] = useState('');
   const [saving, setSaving] = useState(false);
+  // ★ 拍照识别的确认弹窗（F1：识别后先确认再入库）
+  const [reviewOpen, setReviewOpen] = useState(false);
+  const [reviewItems, setReviewItems] = useState<ReviewItem[]>([]);
+  const [reviewSource, setReviewSource] = useState<'photo' | 'voice'>('photo');
   // 语音
   const [recorder, setRecorder] = useState<Taro.RecorderManager | null>(null);
   const [recording, setRecording] = useState(false);
@@ -41,6 +79,16 @@ export default function FridgePage() {
   useEffect(() => {
     load();
   }, []);
+
+  /**
+   * ★ tab 页切回来时刷新
+   *   此前只在挂载时 load：从做菜页「一键补货」写入冰箱后切到冰箱页，
+   *   数据其实已入库，但页面还是旧列表 —— 必须重新进小程序才看得到。
+   *   useDidShow 覆盖"切 tab 回来"这一路径。
+   */
+  useDidShow(() => {
+    load();
+  });
 
   // 录音初始化（仅小程序）
   useEffect(() => {
@@ -105,36 +153,120 @@ export default function FridgePage() {
     }
   };
 
-  /** 拍照 -> 上传云存储 -> 视觉识别 -> 批量入库 */
+  /** 打开确认弹窗（识别结果作为初值，用户可增删改） */
+  const openReview = (source: 'photo' | 'voice', items: ReviewItem[]) => {
+    setReviewSource(source);
+    setReviewItems(items);
+    setReviewOpen(true);
+  };
+
+  /** 弹窗内：改数量 */
+  const bumpReviewQty = (idx: number, delta: number) => {
+    setReviewItems((prev) =>
+      prev.map((p, j) => (j === idx ? { ...p, quantity: Math.max(1, p.quantity + delta) } : p)),
+    );
+  };
+
+  /** 弹窗内：改单位（同步给一个合理数量） */
+  const changeReviewUnit = (idx: number, unit: string) => {
+    setReviewItems((prev) =>
+      prev.map((p, j) =>
+        j === idx ? { ...p, unit, quantity: guessQuantity(p.name, unit as never) } : p,
+      ),
+    );
+  };
+
+  /** 弹窗内：改名称 */
+  const changeReviewName = (idx: number, name: string) => {
+    setReviewItems((prev) => prev.map((p, j) => (j === idx ? { ...p, name } : p)));
+  };
+
+  /** 弹窗内：删除某项（识别错了） */
+  const removeReviewItem = (idx: number) => {
+    setReviewItems((prev) => prev.filter((_, j) => j !== idx));
+  };
+
+  /** 弹窗内：手动新增一项（识别漏了 / 识别失败时的兜底 F3） */
+  const addReviewItem = () => {
+    setReviewItems((prev) => [...prev, { name: '', quantity: 1, unit: '份' }]);
+  };
+
+  /** ★ 确认入库：校验名称非空后写入 */
+  const confirmReview = async () => {
+    const items = reviewItems.filter((it) => it.name && it.name.trim());
+    if (items.length === 0) {
+      Taro.showToast({ title: '请至少填写一种食材', icon: 'none' });
+      return;
+    }
+    Taro.showLoading({ title: '入库中...' });
+    let toastMsg = '';
+    try {
+      const res = await batchAddIngredients(
+        items.map((it) => ({
+          name: it.name.trim(),
+          quantity: it.quantity,
+          unit: it.unit,
+          shelfLifeDays: it.shelfLifeDays,
+          source: reviewSource,
+        })),
+      );
+      // ★ 后端会做同类项合并，把"合并了几条"如实告诉用户
+      const merged = (res as { merged?: number })?.merged ?? 0;
+      toastMsg =
+        merged > 0
+          ? `已入库 ${items.length} 种（${merged} 种与冰箱已有食材合并）`
+          : `已录入 ${items.length} 种食材`;
+      setReviewOpen(false);
+      load();
+    } catch (e) {
+      console.error('[fridge] review confirm error', e);
+      toastMsg = '入库失败，请稍后再试';
+    } finally {
+      Taro.hideLoading();
+      if (toastMsg) Taro.showToast({ title: toastMsg, icon: 'none', duration: 2500 });
+    }
+  };
+
+  /**
+   * 拍照 → base64 直传视觉模型 → **弹窗确认** → 入库
+   * ---------------------------------------------------------------
+   * ★ F1：此前识别完直接入库，用户没有机会核对/修正。
+   * ★ F2：图片不落云存储，base64 直传，调用后即销毁。
+   * ★ F3：识别失败/条数少时，允许用户手动补充后再确认。
+   */
   const handlePickPhoto = async () => {
     try {
       const res = await Taro.chooseImage({ count: 1 });
       const filePath = res.tempFilePaths[0];
       Taro.showLoading({ title: '识别中...' });
-      // ★ 替代原 Network.uploadFile：先传云存储拿 fileID，再把 fileID 交给视觉模型
-      const fileID = await uploadIngredientPhoto(filePath);
-      const recognizeData = await aiRecognizePhoto(fileID);
-      Taro.hideLoading();
-      const items = recognizeData.items ?? [];
-      if (items.length === 0) {
-        Taro.showToast({ title: '未识别出食材，请换张清晰照片', icon: 'none' });
-        return;
-      }
-      await batchAddIngredients(
-        items.map((it) => ({
+
+      let toastMsg = '';
+      let items: ReviewItem[] = [];
+      try {
+        // ★ F2：base64 直传，不经过云存储
+        const dataUrl = await readImageAsDataUrl(filePath);
+        const recognizeData = await aiRecognizePhoto(dataUrl);
+        items = (recognizeData.items ?? []).map((it) => ({
           name: it.name,
-          quantity: it.quantity,
-          unit: it.unit,
-          shelfLifeDays: it.shelfLifeDays,
-          source: 'photo' as const,
-        })),
-      );
-      Taro.showToast({ title: `已录入 ${items.length} 种食材`, icon: 'success' });
-      load();
+          quantity: it.quantity ?? 1,
+          unit: it.unit || guessUnit(it.name),
+          shelfLifeDays: it.shelfLifeDays ?? 3,
+        }));
+        // 识别失败时：不阻断，进弹窗让用户手动添加（F3）
+        if (items.length === 0) {
+          toastMsg = '未识别出食材，可手动添加后入库';
+        }
+      } catch (e) {
+        console.error('[fridge] photo recognize error', e);
+        toastMsg = '识别失败，可手动添加后入库';
+      } finally {
+        Taro.hideLoading();
+      }
+
+      openReview('photo', items);
+      if (toastMsg) Taro.showToast({ title: toastMsg, icon: 'none', duration: 2500 });
     } catch (e) {
-      Taro.hideLoading();
       console.error('[fridge] photo error', e);
-      Taro.showToast({ title: '识别失败', icon: 'none' });
     }
   };
 
@@ -146,30 +278,28 @@ export default function FridgePage() {
    */
   const parseVoice = async (filePath: string) => {
     Taro.showLoading({ title: '识别中...' });
+    let toastMsg = '';
+    let items: ReviewItem[] = [];
     try {
-      const fileID = await uploadIngredientPhoto(filePath);
-      const recognizeData = await aiRecognizePhoto(fileID);
-      Taro.hideLoading();
-      const items = recognizeData.items ?? [];
-      if (items.length === 0) {
-        Taro.showToast({ title: '未识别出食材，可改用文本输入', icon: 'none' });
-        return;
-      }
-      await batchAddIngredients(
-        items.map((it) => ({
-          name: it.name,
-          quantity: it.quantity,
-          unit: it.unit,
-          source: 'voice' as const,
-        })),
-      );
-      Taro.showToast({ title: '语音录入成功', icon: 'success' });
-      load();
+      // 语音走视觉通道兜底：同样 base64 直传，不落云存储
+      const dataUrl = await readImageAsDataUrl(filePath);
+      const recognizeData = await aiRecognizePhoto(dataUrl);
+      items = (recognizeData.items ?? []).map((it) => ({
+        name: it.name,
+        quantity: it.quantity ?? 1,
+        unit: it.unit || guessUnit(it.name),
+        shelfLifeDays: it.shelfLifeDays ?? 3,
+      }));
+      if (items.length === 0) toastMsg = '未识别出食材，可手动添加或改用文本输入';
     } catch (e) {
+      console.error('[fridge] voice recognize error', e);
+      toastMsg = '识别失败，可手动添加或改用文本输入';
+    } finally {
       Taro.hideLoading();
-      console.error('[fridge] voice error', e);
-      Taro.showToast({ title: '语音识别失败，请用文本录入', icon: 'none' });
     }
+    // ★ 同样进确认弹窗，用户核对后再入库
+    openReview('voice', items);
+    if (toastMsg) Taro.showToast({ title: toastMsg, icon: 'none', duration: 2500 });
   };
 
   const startRecord = () => {
@@ -243,7 +373,7 @@ export default function FridgePage() {
                           <Badge className={`${st.chip} border-0`}>{st.text}</Badge>
                         </View>
                         <Text className="block text-sm text-gray-500 mt-1">
-                          数量 {it.quantity} {it.unit} · {it.source === 'photo' ? '拍照' : it.source === 'voice' ? '语音' : '文本'}录入
+                          数量 {it.quantity} {it.unit} · {formatSource(it.source)}录入
                         </Text>
                         <Text className={`block text-xs mt-1 ${days < 0 ? 'text-[#F44336]' : days <= 1 ? 'text-[#E6A700]' : 'text-gray-400'}`}>
                           {days < 0 ? `已过期 ${-days} 天` : days === 0 ? '今天到期' : `剩余 ${days} 天`}
@@ -331,6 +461,105 @@ export default function FridgePage() {
               <Button variant="outline" className="flex-1" onClick={() => setTextOpen(false)}>取消</Button>
               <Button className="flex-1 bg-[#FF8C42]" disabled={saving} onClick={handleTextSubmit}>
                 {saving ? '识别中...' : '识别录入'}
+              </Button>
+            </View>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/*
+        ★ F1：拍照/语音识别的**确认弹窗**
+        识别结果只是"初稿"，用户核对/修正后才入库 —— 避免识别错了直接污染冰箱。
+        可改名称、数量、单位，可删除误识别项，也可手动补一项（F3 兜底）。
+      */}
+      <Dialog open={reviewOpen} onOpenChange={setReviewOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>确认食材 🧺</DialogTitle>
+          </DialogHeader>
+          <View className="flex flex-col py-2">
+            <Text className="block text-sm text-gray-500 mb-3">
+              以下是识别结果，请核对后入库。可以修改名称、数量与单位。
+            </Text>
+
+            {reviewItems.length === 0 ? (
+              <Text className="block text-center text-gray-400 py-6">
+                暂无识别结果，可点下方「手动添加一项」
+              </Text>
+            ) : (
+              <View className="flex flex-col gap-3 max-h-96">
+                {reviewItems.map((it, i) => (
+                  <View key={`${it.name}-${i}`} className="flex flex-col gap-2 border-b border-gray-50 pb-3 last:border-0">
+                    <View className="flex flex-row items-center gap-2">
+                      {/* 名称可编辑 */}
+                      <View className="flex-1 bg-gray-50 rounded-xl px-3 py-2">
+                        <Input
+                          className="w-full bg-transparent"
+                          placeholder="食材名称"
+                          value={it.name}
+                          onInput={(e) => changeReviewName(i, e.detail.value)}
+                        />
+                      </View>
+                      <Button
+                        size="icon"
+                        variant="outline"
+                        className="rounded-full h-8 w-8"
+                        onClick={() => removeReviewItem(i)}
+                      >
+                        <Trash2 size={14} color="#F44336" />
+                      </Button>
+                    </View>
+                    <View className="flex flex-row items-center gap-3">
+                      <Button
+                        size="icon"
+                        variant="outline"
+                        className="rounded-full h-8 w-8"
+                        onClick={() => bumpReviewQty(i, -1)}
+                      >
+                        −
+                      </Button>
+                      <Text className="block text-base font-bold text-gray-800 w-16 text-center">
+                        {it.quantity}
+                      </Text>
+                      <Button
+                        size="icon"
+                        variant="outline"
+                        className="rounded-full h-8 w-8"
+                        onClick={() => bumpReviewQty(i, 1)}
+                      >
+                        ＋
+                      </Button>
+                      {/* 单位可选（入库时后端归一化） */}
+                      <View className="flex-1">
+                        <Select value={it.unit} onValueChange={(v) => changeReviewUnit(i, v)}>
+                          <SelectTrigger className="w-full">
+                            <SelectValue placeholder="单位" />
+                          </SelectTrigger>
+                          <SelectContent>
+                            {UNIT_OPTIONS.map((u) => (
+                              <SelectItem key={u} value={u}>
+                                {u}
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                      </View>
+                    </View>
+                  </View>
+                ))}
+              </View>
+            )}
+
+            <Button variant="outline" className="w-full mt-3" onClick={addReviewItem}>
+              <Plus size={16} color="#FF8C42" className="mr-1" />
+              手动添加一项
+            </Button>
+          </View>
+          <DialogFooter>
+            <View className="flex flex-row gap-3 w-full">
+              <Button variant="outline" className="flex-1" onClick={() => setReviewOpen(false)}>取消</Button>
+              <Button className="flex-1 bg-[#FF8C42]" onClick={confirmReview}>
+                确认入库（{reviewItems.filter((it) => it.name && it.name.trim()).length} 种）
               </Button>
             </View>
           </DialogFooter>

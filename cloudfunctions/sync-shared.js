@@ -14,15 +14,22 @@ const path = require('path');
 const ROOT = __dirname;
 const SHARED_DIR = path.join(ROOT, '_shared');
 /** 需要同步到各云函数的文件（不含 builtin-recipes，仅 db-init/recipe 需要） */
-const FILES = ['common.js', 'schema.js', 'shelf-life-dict.js', 'builtin-recipes.js'];
+const FILES = [
+  'common.js',
+  'schema.js',
+  'shelf-life-dict.js',
+  'builtin-recipes.js',
+  'prompts.js',
+  'ingredient-names.js',
+];
 
 /** 各云函数需要哪些公共文件（按需精简，减小部署体积） */
 const TARGETS = {
   'db-init': ['common.js', 'schema.js', 'builtin-recipes.js'],
   user: ['common.js', 'schema.js'],
-  ingredient: ['common.js', 'schema.js', 'shelf-life-dict.js'],
-  recipe: ['common.js', 'schema.js', 'builtin-recipes.js'],
-  'ai-text': ['common.js'],
+  ingredient: ['common.js', 'schema.js', 'shelf-life-dict.js', 'ingredient-names.js'],
+  recipe: ['common.js', 'schema.js', 'builtin-recipes.js', 'ingredient-names.js'],
+  'ai-text': ['common.js', 'prompts.js', 'ingredient-names.js'],
   'ai-image': ['common.js'],
   'recipe-sync': ['common.js', 'schema.js'],
 };

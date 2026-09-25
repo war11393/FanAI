@@ -21,6 +21,7 @@
 const { db, _, wrap, ok, requireFields, BizError } = require('./common');
 const { COLLECTIONS } = require('./schema');
 const { BUILTIN_RECIPES } = require('./builtin-recipes');
+const { canonicalName, isBasicSeasoning, canonicalList } = require('./ingredient-names');
 
 const PAGE_SIZE = 100;
 
@@ -205,6 +206,70 @@ exports.main = wrap(async (event) => {
         .limit(PAGE_SIZE)
         .get();
       return ok({ list: data || [] });
+    }
+
+    /**
+     * ★ 近一周做过的菜（供 recommend prompt 避开重复）
+     * 入参：{ action:'recentDishes', days?:7 }
+     * 出参：{ dishes: string[] }（去重后的菜名）
+     */
+    case 'recentDishes': {
+      const days = Number(event.days) > 0 ? Number(event.days) : 7;
+      const since = new Date(Date.now() - days * 24 * 3600 * 1000).toISOString().slice(0, 10);
+      const { data } = await PLANS()
+        .where({ openid, date: _.gte(since) })
+        .orderBy('date', 'desc')
+        .limit(PAGE_SIZE)
+        .get();
+      const names = new Set();
+      for (const plan of data || []) {
+        for (const d of plan.selectedDishes || []) {
+          const n = d && d.name ? String(d.name).trim() : '';
+          if (n) names.add(n);
+        }
+      }
+      return ok({ dishes: Array.from(names), since });
+    }
+
+    /**
+     * ★ 按现有食材匹配菜谱（供 recommend prompt 给出候选菜名）
+     * 入参：{ action:'matchByIngredients', ingredients: string[], limit?:12, minMatches?:1 }
+     * 出参：{ list: [{ name, matchCount, totalCount }] }
+     *
+     * 【为什么在云端做】菜谱库 372 条，全量发给前端再由前端筛是浪费；
+     *   这里只回候选菜名，prompt 与网络都只承担必要信息（D1 决策）。
+     */
+    case 'matchByIngredients': {
+      const owned = canonicalList(event.ingredients || []);
+      if (owned.length === 0) return ok({ list: [] });
+      const ownedSet = new Set(owned);
+
+      // 只取匹配需要的字段，减小传输与内存
+      const { data } = await RECIPES()
+        .where(visibleWhere(openid))
+        .field({ name: true, ingredients: true, category: true })
+        .limit(PAGE_SIZE)
+        .get();
+
+      const scored = [];
+      for (const r of data || []) {
+        const need = canonicalList(r.ingredients || []);
+        if (need.length === 0) continue;
+        const match = need.filter((x) => ownedSet.has(x)).length;
+        if (match < (Number(event.minMatches) || 1)) continue;
+        scored.push({
+          name: r.name,
+          category: r.category || '',
+          matchCount: match,
+          totalCount: need.length,
+          // 匹配率：命中数 / 该菜所需食材数，用于优先推荐"最容易做"的
+          ratio: match / need.length,
+        });
+      }
+
+      scored.sort((a, b) => b.matchCount - a.matchCount || b.ratio - a.ratio);
+      const limit = Number(event.limit) > 0 ? Number(event.limit) : 12;
+      return ok({ list: scored.slice(0, limit), matched: scored.length });
     }
 
     case 'savePlan': {

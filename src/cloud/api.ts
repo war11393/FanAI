@@ -35,7 +35,11 @@ export interface Ingredient {
   addTime: string;
   expireTime: string;
   status: 'fresh' | 'expiring' | 'expired';
-  source?: 'photo' | 'voice' | 'text';
+  /**
+   * 录入途径。★ 同类项合并后可能是组合值，如 'text+photo'
+   * （先文本录入"番茄"、后拍照录入"西红柿"，两条已合并为一条）
+   */
+  source?: 'photo' | 'voice' | 'text' | string;
 }
 
 export interface Recipe {
@@ -73,6 +77,8 @@ export interface AiDish {
   duration_minutes?: number;
   difficulty?: string;
   ingredients?: string[];
+  /** ★ 现有食材里没有、建议补充的（由大模型判定） */
+  missing_ingredients?: string[];
   brief?: string;
   main_steps?: string[];
 }
@@ -169,6 +175,17 @@ export const removeRecipe = (id: string): Promise<{ id: string; removed: boolean
 export const listMealPlans = (status?: string): Promise<{ list: MealPlan[] }> =>
   callCloud(CLOUD_FN.RECIPE, { action: 'listPlans', status });
 
+/** ★ 近一周做过的菜名（供 AI 推荐避开重复） */
+export const listRecentDishes = (days = 7): Promise<{ dishes: string[]; since: string }> =>
+  callCloud(CLOUD_FN.RECIPE, { action: 'recentDishes', days });
+
+/** ★ 按现有食材匹配菜谱库，返回候选菜名（云端匹配，只回关键信息） */
+export const matchRecipesByIngredients = (
+  ingredients: string[],
+  limit = 12,
+): Promise<{ list: Array<{ name: string; category: string; matchCount: number; totalCount: number }>; matched: number }> =>
+  callCloud(CLOUD_FN.RECIPE, { action: 'matchByIngredients', ingredients, limit });
+
 export const saveMealPlan = (plan: {
   date: string;
   dinersCount?: number;
@@ -201,6 +218,12 @@ export const aiRecommend = (payload: {
   stoves?: Array<{ type: string; count: number }>;
   allergies?: string[];
   taboos?: string[];
+  /** ★ 口味偏好，作为推荐约束 */
+  flavors?: string[];
+  /** ★ 近一周做过的菜名（让模型避开重复） */
+  recentDishes?: string[];
+  /** ★ 菜谱库里按食材匹配到的候选菜名 */
+  recipeHints?: string[];
 }): Promise<{ dishes: AiDish[]; aiOffline: boolean }> =>
   callCloud(CLOUD_FN.AI_TEXT, { action: 'recommend', ...payload });
 
@@ -218,6 +241,30 @@ export const aiCooking = (payload: {
   stoves?: Array<{ type: string; count: number }>;
 }): Promise<{ steps: AiStep[]; final_message: string; aiOffline: boolean }> =>
   callCloud(CLOUD_FN.AI_TEXT, { action: 'cooking', ...payload });
+
+/**
+ * ★ E2：备菜 + 做菜流程合并为一次调用
+ *   一次拿到 prep_list / cooking_tips / steps / final_message，
+ *   避免「点备菜完成还要再等一轮大模型」。
+ */
+export const aiCookingPlan = (payload: {
+  dinersCount: number;
+  dishes: Array<{
+    name: string;
+    ingredients?: string[];
+    main_steps?: string[];
+  }>;
+  stoves?: Array<{ type: string; count: number }>;
+  ingredients?: string[];
+}): Promise<{
+  prep_list: AiPrepItem[];
+  cooking_tips: string[];
+  steps: AiStep[];
+  final_message: string;
+  /** ★ 本次选中菜的缺料（供备菜环节补货） */
+  missing_list?: Array<{ name: string; dishes: string[]; quantity: number; unit: string }>;
+  aiOffline: boolean;
+}> => callCloud(CLOUD_FN.AI_TEXT, { action: 'cookingPlan', ...payload });
 
 /* ============================================================
  * AI 生图能力（菜谱成品图）

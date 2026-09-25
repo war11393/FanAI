@@ -23,9 +23,20 @@
  */
 
 const { cloud, wrap, ok, requireFields, BizError } = require('./common');
-
-const JSON_INSTRUCT =
-  '请只输出一个合法的 JSON 对象，不要输出任何解释、前言或 markdown 代码围栏。';
+const {
+  composeSystem,
+  RECOMMEND,
+  COOKING_PLAN,
+  RECOGNIZE,
+  PARSE_TEXT,
+} = require('./prompts');
+// ★ 食材名称归一化（同义词/基础调料判定）统一走共享模块，
+//   避免与 recipe / ingredient 云函数各写一份而漂移（D1 要求）
+const {
+  canonicalName,
+  isBasicSeasoning,
+  normalizeName,
+} = require('./ingredient-names');
 
 /* ============================================================
  * 一、Provider 层：统一封装「文本生成」与「视觉识别」
@@ -125,30 +136,90 @@ async function httpChat(systemPrompt, userContent, kind, opts = {}) {
  * 失败返回 null，由调用方走兜底
  */
 async function generateJson(systemPrompt, userPrompt, opts = {}) {
+  const tag = opts.tag || 'generateJson';
+  const t0 = Date.now();
   try {
     const provider = currentProvider();
+    // ★ 详细日志（A3）：便于在控制台定位是哪一版 prompt、什么入参、耗时多久
+    console.log(
+      `[ai-text][${tag}] → 请求 provider=${provider} model=${currentModelName('text', opts)} promptVersion=${opts.promptVersion || '-'} promptChars=${(systemPrompt || '').length}+${(userPrompt || '').length} keys=${JSON.stringify(opts.inputKeys || [])}`,
+    );
+    if (opts.logPromptBody) {
+      console.log(`[ai-text][${tag}] system=${JSON.stringify(systemPrompt)}`);
+      console.log(`[ai-text][${tag}] user=${JSON.stringify(userPrompt)}`);
+    }
     const text =
       provider === 'http'
         ? await httpChat(systemPrompt, userPrompt, 'text', opts)
         : await cloudbaseChat(systemPrompt, userPrompt, 'text', opts);
-    return safeParseJson(text);
+    const ms = Date.now() - t0;
+    const parsed = safeParseJson(text);
+    console.log(
+      `[ai-text][${tag}] ← 返回 ${ms}ms textLen=${(text || '').length} parsed=${parsed ? 'OK' : 'NULL'}`,
+    );
+    if (!parsed) {
+      // 解析失败时把原始文本打出来（截断），这是排查 JSON 结构问题最关键的证据
+      console.error(`[ai-text][${tag}] JSON 解析失败，原始返回（前 800 字）：${String(text).slice(0, 800)}`);
+    }
+    return parsed;
   } catch (e) {
-    console.error('[ai-text] generateJson error', currentProvider(), e && e.message);
+    const ms = Date.now() - t0;
+    console.error(`[ai-text][${tag}] ✗ 调用失败 ${ms}ms provider=${currentProvider()} err=${e && e.message}`);
     return null;
   }
 }
 
-/** 视觉识别：传入云存储 fileID 或公网 URL */
-async function analyzeImage(imageUrl, userPrompt) {
+/** 当前使用的模型名（仅用于日志） */
+function currentModelName(kind, opts = {}) {
+  if (currentProvider() === 'http') {
+    return (
+      opts.model ||
+      (kind === 'image' ? process.env.AI_HTTP_VISION_MODEL : undefined) ||
+      process.env.AI_HTTP_MODEL ||
+      'gpt-4o-mini'
+    );
+  }
+  return process.env.AI_TEXT_MODEL || 'hy3';
+}
+
+/** 视觉识别：传入云存储 fileID、公网 URL 或 base64 data URL */
+async function analyzeImage(imageUrl, userPrompt, opts = {}) {
+  const tag = opts.tag || 'analyzeImage';
+  const t0 = Date.now();
   try {
     const provider = currentProvider();
+    const urlStr = String(imageUrl || '');
+    const isDataUrl = /^data:/.test(urlStr);
+
+    // ★ base64 体积保护：data URL 超过约 4MB 时模型侧多半也会拒，
+    //   这里提前给出可读错误，而不是让请求跑到超时（用户拍的原图常有 3-8MB）
+    const MAX_DATA_URL = 4 * 1024 * 1024;
+    if (isDataUrl && urlStr.length > MAX_DATA_URL) {
+      console.error(
+        `[ai-text][${tag}] ✗ 图片过大 ${(urlStr.length / 1024 / 1024).toFixed(1)}MB（上限 ${MAX_DATA_URL / 1024 / 1024}MB），建议压缩后重试`,
+      );
+      return null;
+    }
+
+    console.log(
+      `[ai-text][${tag}] → 视觉请求 provider=${provider} model=${currentModelName('image', opts)} imageKind=${isDataUrl ? 'base64' : 'url'} imageLen=${urlStr.length} promptVersion=${opts.promptVersion || '-'}`,
+    );
     const text =
       provider === 'http'
-        ? await httpChat('', userPrompt, 'image', { imageUrl })
-        : await cloudbaseChat('', userPrompt, 'image', { imageUrl });
-    return safeParseJson(text);
+        ? await httpChat(opts.systemPrompt || '', userPrompt, 'image', { imageUrl })
+        : await cloudbaseChat(opts.systemPrompt || '', userPrompt, 'image', { imageUrl });
+    const ms = Date.now() - t0;
+    const parsed = safeParseJson(text);
+    console.log(
+      `[ai-text][${tag}] ← 返回 ${ms}ms textLen=${(text || '').length} parsed=${parsed ? 'OK' : 'NULL'}`,
+    );
+    if (!parsed) {
+      console.error(`[ai-text][${tag}] JSON 解析失败，原始返回（前 800 字）：${String(text).slice(0, 800)}`);
+    }
+    return parsed;
   } catch (e) {
-    console.error('[ai-text] analyzeImage error', currentProvider(), e && e.message);
+    const ms = Date.now() - t0;
+    console.error(`[ai-text][${tag}] ✗ 视觉调用失败 ${ms}ms provider=${currentProvider()} err=${e && e.message}`);
     return null;
   }
 }
@@ -339,12 +410,14 @@ function fallbackCooking(dishes) {
 /** 拍照识别食材：AI 失败时返回空并标记 aiOffline */
 async function handleRecognize(event) {
   requireFields(event, ['imageUrl']);
-  const prompt = `你是冰箱食材识别助手。请识别这张照片中的所有食材。
-要求：只输出食材名称（标准中文名）、可估算的份量数量、单位（如 g/个/棵）、以及基于常温/冷藏的保质期天数（单位：天，合理估算）。
-输出格式：{"items":[{"name":"土豆","quantity":3,"unit":"个","shelfLifeDays":30}]}。最多返回 8 项。
-${JSON_INSTRUCT}`;
+  const system = composeSystem(RECOGNIZE);
+  const user = RECOGNIZE.build(event);
 
-  const result = await analyzeImage(event.imageUrl, prompt);
+  const result = await analyzeImage(event.imageUrl, user, {
+    systemPrompt: system,
+    tag: 'recognize',
+    promptVersion: RECOGNIZE.version,
+  });
   const list = Array.isArray(result?.items) ? result.items : [];
   const items = list
     .filter((it) => it && it.name)
@@ -355,6 +428,7 @@ ${JSON_INSTRUCT}`;
       shelfLifeDays: Number(it.shelfLifeDays) || 3,
       confidence: Number(it.confidence) ?? 1,
     }));
+  console.log(`[ai-text][recognize] 解析出 ${items.length} 项食材`);
   return ok({ items, aiOffline: items.length === 0 });
 }
 
@@ -362,14 +436,13 @@ ${JSON_INSTRUCT}`;
 async function handleParse(event) {
   requireFields(event, ['text']);
   const text = event.text;
-  const prompt = `你是食材录入助手。请从下面的口语化文本中提取所有食材（名词），并推断份量。
-例如"买了两个西红柿和半斤五花肉" → [{"name":"西红柿","quantity":2,"unit":"个"},{"name":"五花肉","quantity":250,"unit":"g"}]。
-只输出食材，输出格式：{"items":[{"name":"","quantity":1,"unit":"个"}]}。
-${JSON_INSTRUCT}
-文本内容：${text}`;
+  const system = composeSystem(PARSE_TEXT);
+  const user = PARSE_TEXT.build({ text });
 
-  const result = await generateJson('你是结构化的中文食材解析器，只输出 JSON。', prompt, {
+  const result = await generateJson(system, user, {
     temperature: 0.2,
+    tag: 'parseText',
+    promptVersion: PARSE_TEXT.version,
   });
   const list = Array.isArray(result?.items) ? result.items : [];
   let items = list
@@ -390,88 +463,200 @@ ${JSON_INSTRUCT}
 
 /**
  * 菜谱推荐
- * 情况 A：冰箱有食材 -> 用现有食材推荐 3 道菜
+ * 情况 A：冰箱有食材 -> 用现有食材推荐 3 道菜（缺料列入 missing_ingredients）
  * 情况 B：无食材 -> 按人数推荐 3 道家常菜
+ *
+ * ★ D1：可传入 recipeHints（从菜谱库按食材匹配出的候选菜名，只给关键信息）
+ * ★ D2：可传入 recentDishes（近一周做过的菜，让模型避开）
  */
 async function handleRecommend(event) {
   requireFields(event, ['dinersCount']);
-  const dinersCount = event.dinersCount;
-  const ingredients = event.ingredients || [];
-  const stoves = event.stoves || [];
-  const allergies = event.allergies || [];
-  const taboos = event.taboos || [];
+  const input = {
+    dinersCount: event.dinersCount,
+    ingredients: event.ingredients || [],
+    stoves: event.stoves || [],
+    allergies: event.allergies || [],
+    taboos: event.taboos || [],
+    flavors: event.flavors || [],
+    recentDishes: event.recentDishes || [],
+    recipeHints: event.recipeHints || [],
+  };
 
-  const system =
-    '你是一位资深家常菜大厨。推荐菜品时需考虑人数、现有食材、灶具数量、过敏史与饮食禁忌。请只输出 JSON。';
-  const user = `总就餐人数：${dinersCount} 人
-现有食材：${ingredients.length ? ingredients.filter(Boolean).join('、') : '（无，冰箱空）'}
-灶具情况：${stoves.length ? stoves.map((s) => `${s.type}x${s.count}`).join('、') : '（未知）'}
-过敏史：${allergies.length ? allergies.join('、') : '无'}
-饮食禁忌：${taboos.length ? taboos.join('、') : '无'}
+  const system = composeSystem(RECOMMEND);
+  const user = RECOMMEND.build(input);
 
-${ingredients.length ? '情况 A：请推荐 3 道能用这些现有食材做出的菜（可少量补充家常调味料）。' : '情况 B：请推荐 3 道适合该人数的经典家常菜。'}
-要求每道菜包含：name（菜名）、duration_minutes（预计耗时分钟）、difficulty（简单/中等/较难）、ingredients（所需食材名称数组）、brief（一句话简介）、main_steps（2-4条主要做法步骤）。
-输出格式：{"dishes":[{"name":"","duration_minutes":0,"difficulty":"","ingredients":[""],"brief":"","main_steps":[""]}]}`;
-
-  const result = await generateJson(system, user, { temperature: 0.7 });
+  const result = await generateJson(system, user, {
+    temperature: 0.7,
+    tag: 'recommend',
+    promptVersion: RECOMMEND.version,
+    logPromptBody: true, // ★ 推荐是核心链路，完整打印 prompt 便于调优
+    inputKeys: Object.keys(input).filter((k) => input[k] && input[k].length !== 0),
+  });
   const dishes = Array.isArray(result?.dishes) ? result.dishes : [];
   let aiOffline = false;
-  let final = dishes.filter((d) => d && d.name);
+  let final = dishes.filter((d) => d && d.name).map(normalizeDish);
   if (final.length === 0) {
     aiOffline = true;
-    final = fallbackRecommend(dinersCount, ingredients);
+    final = fallbackRecommend(input.dinersCount, input.ingredients);
   }
+  console.log(`[ai-text][recommend] 返回 ${final.length} 道菜 aiOffline=${aiOffline}`);
   return ok({ dishes: final, aiOffline });
 }
 
-/** 备菜清单生成 */
-async function handlePrep(event) {
-  requireFields(event, ['dinersCount']);
-  const { dinersCount, dishes = [] } = event;
-  const system =
-    '你是家庭厨房备菜助手，请为多道菜生成去重后的备菜清单（动词+食材），并给出每道菜可并行开始的顺序提示。只输出 JSON。';
-  const user = `就餐人数：${dinersCount}人。选定菜品：${dishes.map((d) => d.name).join('、')}。
-请生成去重后的备菜清单，每项含：task（如"切土豆丝"）、dish（所属菜名）、minutes（预估分钟）、done（false）。
-同时给出 cooking_tips（1-2条统筹建议，如先炖后炒）。
-输出格式：{"prep_list":[{"task":"","dish":"","minutes":0,"done":false}],"cooking_tips":[""]}`;
-
-  const result = await generateJson(system, user, { temperature: 0.5 });
-  const prepList = Array.isArray(result?.prep_list) ? result.prep_list : [];
-  let final = prepList.filter((p) => p && p.task);
-  let aiOffline = false;
-  let tips = result?.cooking_tips ?? [];
-  if (final.length === 0) {
-    aiOffline = true;
-    final = fallbackPrep(dishes);
-    tips = ['建议先把耗时长的炖煮类准备好，炒菜类可最后处理', '两样快手菜可轮流起锅，减少等待'];
-  }
-  return ok({ prep_list: final, cooking_tips: tips, aiOffline });
+/**
+ * 规整单道菜的结构，保证前端拿到的字段稳定存在
+ * ★ missing_ingredients 是本次新增（缺料补充建议），前端据此展示"建议补充"
+ */
+function normalizeDish(d) {
+  const arr = (v) => (Array.isArray(v) ? v.filter((x) => typeof x === 'string' && x.trim()) : []);
+  return {
+    name: String(d.name),
+    duration_minutes: Number(d.duration_minutes) || 0,
+    difficulty: String(d.difficulty || '中等'),
+    ingredients: arr(d.ingredients),
+    missing_ingredients: arr(d.missing_ingredients),
+    brief: String(d.brief || ''),
+    main_steps: arr(d.main_steps),
+  };
 }
 
-/** 做菜步骤排序：结合灶具情况智能安排 */
-async function handleCooking(event) {
+/**
+ * 备菜 + 做菜流程（★ E2 决策：合并为一次调用）
+ * ---------------------------------------------------------------
+ * 原先是 prep / cooking 两次独立调用，点"开始做菜"要等两轮大模型。
+ * 现合并为一次：一次返回备菜清单 + 烹饪步骤 + 统筹建议。
+ *
+ * 【入参】dinersCount / dishes（含 name/ingredients/main_steps）/ stoves / ingredients
+ * 【出参】{ prep_list, cooking_tips, steps, final_message, aiOffline }
+ * ★ 兼容性：接口同时保留 prep_list 与 steps 两套字段，
+ *   前端 cook 页可一次性拿到全部数据，无需改调用次数。
+ */
+async function handleCookingPlan(event) {
   requireFields(event, ['dinersCount']);
-  const { dinersCount, dishes = [], stoves = [] } = event;
-  const system =
-    '你是厨房统筹导演，结合灶具数量把多道菜的做菜步骤排成串行流程，标注每当可同时开火的并行步骤。只输出 JSON。';
-  const user = `就餐人数：${dinersCount}人。灶具：${stoves.length ? stoves.map((s) => `${s.type}x${s.count}`).join('、') : '燃气灶x2, 电磁炉x1'}。
-菜品详情：${JSON.stringify(dishes)}。
-请生成做菜流程：steps 数组，每项含 seq（序号）、dish（菜名）、instruction（一句话当前步骤）、tips（可选小贴士）、can_parallel（是否可与其他步骤并行）。
-并给出 final_message（出餐祝贺语）。
-输出格式：{"steps":[{"seq":1,"dish":"","instruction":"","tips":"","can_parallel":false}],"final_message":""}`;
+  const input = {
+    dinersCount: event.dinersCount,
+    dishes: event.dishes || [],
+    stoves: event.stoves || [],
+    ingredients: event.ingredients || [],
+  };
 
-  const result = await generateJson(system, user, { temperature: 0.5 });
-  const steps = Array.isArray(result?.steps) ? result.steps : [];
-  const final = steps.filter((s) => s && s.instruction);
-  if (final.length === 0) {
-    const built = fallbackCooking(dishes);
-    return ok({ steps: built.steps, final_message: built.final_message, aiOffline: true });
-  }
-  return ok({
-    steps: final,
-    final_message: result?.final_message ?? '大功告成，开饭啦！',
-    aiOffline: false,
+  const system = composeSystem(COOKING_PLAN);
+  const user = COOKING_PLAN.build(input);
+
+  const result = await generateJson(system, user, {
+    temperature: 0.5,
+    tag: 'cookingPlan',
+    promptVersion: COOKING_PLAN.version,
+    logPromptBody: true,
+    inputKeys: Object.keys(input).filter((k) => input[k] && input[k].length !== 0),
   });
+
+  const rawPrep = Array.isArray(result?.prep_list) ? result.prep_list : [];
+  const prepList = rawPrep.filter((p) => p && p.task);
+  const rawSteps = Array.isArray(result?.steps) ? result.steps : [];
+  const steps = rawSteps.filter((s) => s && s.instruction);
+
+  // ★ 缺料汇总：只为**本次选中的菜**算，故在此处而非选菜页计算。
+  //   现有食材已在入参里，逐道菜比对其 ingredients 即可（不额外调模型，省时省钱）。
+  const missingList = computeMissing(input.dishes, input.ingredients);
+
+  // 两者皆空才算 AI 离线（只有一个空时用兜底补齐，不整体降级）
+  const aiOffline = prepList.length === 0 && steps.length === 0;
+
+  let finalPrep = prepList;
+  let finalSteps = steps;
+  let tips = Array.isArray(result?.cooking_tips) ? result.cooking_tips : [];
+  let finalMessage = result?.final_message || '咔哒！满屋飘香，恭喜出餐 🍳';
+
+  if (aiOffline) {
+    console.log('[ai-text][cookingPlan] 大模型无有效返回，走本地兜底');
+    finalPrep = fallbackPrep(input.dishes);
+    finalSteps = fallbackCooking(input.dishes).steps;
+    tips = ['建议先把耗时长的炖煮类准备好，炒菜类可最后处理', '两样快手菜可轮流起锅，减少等待'];
+    finalMessage = fallbackCooking(input.dishes).final_message;
+  } else if (finalPrep.length === 0) {
+    finalPrep = fallbackPrep(input.dishes);
+  } else if (finalSteps.length === 0) {
+    finalSteps = fallbackCooking(input.dishes).steps;
+  }
+
+  console.log(
+    `[ai-text][cookingPlan] 备菜 ${finalPrep.length} 项 / 步骤 ${finalSteps.length} 条 aiOffline=${aiOffline}`,
+  );
+
+  return ok({
+    prep_list: finalPrep,
+    cooking_tips: tips,
+    steps: finalSteps,
+    final_message: finalMessage,
+    // ★ 本次选中菜的缺料（供备菜环节一键补货）
+    missing_list: missingList,
+    aiOffline,
+  });
+}
+
+/**
+ * 常见食材的默认计量单位（按品类给建议值）
+ * ★ 用户反馈：补货弹窗只有数量没有单位，"不明确"。
+ *   这里给一个按品类推断的合理默认值，前端允许用户改。
+ */
+const UNIT_HINTS = [
+  { re: /肉|排骨|鱼|虾|鸡|鸭|牛|羊|豆腐|蛤|蟹/, unit: 'g' },
+  { re: /蛋/, unit: '个' },
+  { re: /奶|油(?!菜)|酱|醋|酒|汁|汁/, unit: 'ml' },
+  { re: /米|面|粉|糖|盐|豆|花生|干|木耳|香菇|枣/, unit: 'g' },
+  { re: /菜|葱|姜|蒜|椒|瓜|茄|萝卜|薯|笋|菇|苗|叶|芦|芹|韭|瓜/, unit: '斤' },
+  { re: /果|橙|苹果|梨|桃|香蕉|葡萄|莓/, unit: '个' },
+];
+
+/** 推断默认单位（兜底 '份'） */
+function guessUnit(name) {
+  const n = String(name || '');
+  for (const h of UNIT_HINTS) if (h.re.test(n)) return h.unit;
+  return '份';
+}
+
+/** 允许的单位白名单（★ 入库时归一化用，与前端选项保持一致） */
+const ALLOWED_UNITS = new Set(['g', 'kg', '斤', '个', 'ml', 'L', '份', '把', '棵', '包', '盒']);
+
+/**
+ * 单位归一化（★ 入库前统一换算，保证同类食材可比较）
+ *   kg → g，L → ml，其余原样
+ *   未知单位 → 兜底 '份'
+ */
+function normalizeUnit(unit, fallbackName) {
+  const u = String(unit || '').trim();
+  if (!ALLOWED_UNITS.has(u)) return guessUnit(fallbackName);
+  if (u === 'kg') return 'g';
+  if (u === 'L') return 'ml';
+  return u;
+}
+
+/** 计算缺料：返回 [{ name, dishes, quantity, unit }] */
+function computeMissing(dishes = [], owned = []) {
+  const ownedSet = new Set(owned.map(canonicalName).filter(Boolean));
+  /** name -> Set(菜名) */
+  const acc = new Map();
+
+  for (const d of dishes) {
+    const need = Array.isArray(d.ingredients) ? d.ingredients : [];
+    for (const raw of need) {
+      const key = canonicalName(raw);
+      if (!key) continue;
+      if (isBasicSeasoning(key)) continue; // 基础调料不算缺
+      if (ownedSet.has(key)) continue; // 冰箱里有
+      if (!acc.has(key)) acc.set(key, new Set());
+      acc.get(key).add(d.name);
+    }
+  }
+
+  return Array.from(acc.entries()).map(([name, dishSet]) => ({
+    name,
+    dishes: Array.from(dishSet),
+    // ★ 给默认数量与**按品类推断的单位**，前端弹窗直接可编辑
+    quantity: /肉|排骨|鱼|虾|米|面/.test(name) ? 500 : 1,
+    unit: guessUnit(name),
+  }));
 }
 
 /* ============================================================
@@ -480,7 +665,16 @@ async function handleCooking(event) {
 
 exports.main = wrap(async (event) => {
   const action = event.action;
+  const t0 = Date.now();
+  // ★ 每个 action 的入口日志（A3：排查时能确认"云函数到底有没有被调用"）
+  console.log(`[ai-text] ← 调用 action=${action} keys=${JSON.stringify(Object.keys(event || {}))}`);
 
+  const out = await dispatch(action, event);
+  console.log(`[ai-text] → ${action} 完成 ${Date.now() - t0}ms`);
+  return out;
+});
+
+async function dispatch(action, event) {
   switch (action) {
     case 'recognize':
       return handleRecognize(event);
@@ -488,17 +682,26 @@ exports.main = wrap(async (event) => {
       return handleParse(event);
     case 'recommend':
       return handleRecommend(event);
+    // ★ E2：prep / cooking 已合并为 cookingPlan；旧 action 名保留为别名，
+    //   返回体包含了旧接口的全部字段，前端可平滑迁移。
+    case 'cookingPlan':
     case 'prep':
-      return handlePrep(event);
     case 'cooking':
-      return handleCooking(event);
+      return handleCookingPlan(event);
     case 'health':
       return ok({
         status: 'ok',
         provider: currentProvider(),
         textModel: process.env.AI_TEXT_MODEL || 'hy3',
+        // ★ 供冒烟测试核对"云端跑的是哪一版 prompt"
+        promptVersions: {
+          recommend: RECOMMEND.version,
+          cookingPlan: COOKING_PLAN.version,
+          recognize: RECOGNIZE.version,
+          parseText: PARSE_TEXT.version,
+        },
       });
     default:
       throw new BizError('INVALID_ACTION', `未知 action: ${action}`);
   }
-});
+}

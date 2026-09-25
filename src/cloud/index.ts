@@ -120,6 +120,57 @@ export async function callCloud<T = unknown>(
 }
 
 /**
+ * 把本地图片读成 base64 data URL
+ * ★ F2 决策：图片不落云存储，直接 base64 传给视觉模型，调用后即销毁。
+ *   微信端用 getFileSystemManager().readFile({ encoding:'base64' })；
+ *   H5 端降级用 FileReader。
+ *
+ * ★ 体积控制：相机原图常有 3-8MB，base64 后还要膨胀 ~33%，会超出云函数
+ *   入参上限。故先交给平台压缩再读（compressImage 可显著降低体积）。
+ */
+export async function readImageAsDataUrl(filePath: string): Promise<string> {
+  if (Taro.getEnv() === Taro.ENV_TYPE.WEAPP) {
+    // 先压缩：质量 80、限制最长边 1280，够模型识别又不会过大
+    let target = filePath;
+    try {
+      const compressed = await new Promise<string>((resolve) => {
+        Taro.compressImage({
+          src: filePath,
+          quality: 80,
+          compressedWidth: 1280,
+          success: (r) => resolve(r.tempFilePath || filePath),
+          fail: () => resolve(filePath), // 压缩失败就用原图，不阻断流程
+        });
+      });
+      target = compressed;
+    } catch {
+      /* 忽略，用原图 */
+    }
+
+    const fs = Taro.getFileSystemManager();
+    const base64 = await new Promise<string>((resolve, reject) => {
+      fs.readFile({
+        filePath: target,
+        encoding: 'base64',
+        success: (r) => resolve(r.data as string),
+        fail: (e) => reject(new Error(e?.errMsg || '读取图片失败')),
+      });
+    });
+    // 小程序 chooseImage 多为 jpg；png 也走同一分支，模型能自行判断
+    return `data:image/jpeg;base64,${base64}`;
+  }
+  // H5 降级
+  const resp = await fetch(filePath);
+  const blob = await resp.blob();
+  return await new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result));
+    reader.onerror = () => reject(new Error('读取图片失败'));
+    reader.readAsDataURL(blob);
+  });
+}
+
+/**
  * 上传文件到云存储
  * @returns fileID（云存储永久标识）
  */
