@@ -1,33 +1,22 @@
 import { useEffect, useState } from 'react';
 import Taro from '@tarojs/taro';
 import { View, Text } from '@tarojs/components';
-import { Network } from '@/network';
-import { getOpenid } from '@/utils/identity';
+import {
+  getUserProfile,
+  listIngredients,
+  aiRecommend,
+  type UserProfile,
+  type Ingredient,
+  type AiDish,
+} from '@/cloud/api';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog';
 import { Sparkles, UserPlus, RefreshCw, Check } from 'lucide-react-taro';
 
-interface Dish {
-  name: string;
-  duration_minutes?: number;
-  difficulty?: string;
-  ingredients?: string[];
-  brief?: string;
-  main_steps?: string[];
-}
-interface UserProfile {
-  openid: string;
-  regular_members: number;
-  stoves: Array<{ type: string; count: number }>;
-  allergies: string[];
-  taboos: string[];
-  voice_control_on: boolean;
-}
-interface Ingredient { id: string; name: string; status: string }
+type Dish = AiDish;
 
 export default function IndexPage() {
-  const openid = getOpenid();
   const [profile, setProfile] = useState<UserProfile | null>(null);
   const [ingredients, setIngredients] = useState<Ingredient[]>([]);
   const [temporaryGuests, setTemporaryGuests] = useState(0);
@@ -43,12 +32,13 @@ export default function IndexPage() {
 
   const loadHome = async () => {
     try {
-      const [uRes, iRes]: any[] = await Promise.all([
-        Network.request({ url: `/api/users/${openid}` }),
-        Network.request({ url: `/api/ingredients?openid=${openid}` }),
+      // ★ openid 由云函数从微信上下文获取，前端不再传
+      const [profileData, ingredientData] = await Promise.all([
+        getUserProfile(),
+        listIngredients(),
       ]);
-      setProfile(uRes.data?.data ?? null);
-      setIngredients(iRes.data?.data ?? []);
+      setProfile(profileData ?? null);
+      setIngredients(ingredientData.list ?? []);
     } catch (e) {
       console.error('[index] loadHome error', e);
     }
@@ -56,7 +46,7 @@ export default function IndexPage() {
 
   useEffect(() => { loadHome(); }, []);
 
-  const regular = profile?.regular_members ?? 2;
+  const regular = profile?.regularMembers ?? 2;
   const total = regular + temporaryGuests;
   const expiringCount = ingredients.filter((i) => i.status === 'expiring').length;
   const expiredCount = ingredients.filter((i) => i.status === 'expired').length;
@@ -68,18 +58,13 @@ export default function IndexPage() {
     setSelected([]);
     Taro.showLoading({ title: 'AI 正在想今天的菜谱...' });
     try {
-      const res: any = await Network.request({
-        url: '/api/ai/recommend', method: 'POST',
-        data: {
-          openid,
-          dinersCount: regular + useGuests,
-          ingredients: ingredients.map((i) => i.name),
-          stoves: profile?.stoves ?? [],
-          allergies: profile?.allergies ?? [],
-          taboos: profile?.taboos ?? [],
-        },
+      const data = await aiRecommend({
+        dinersCount: regular + useGuests,
+        ingredients: ingredients.map((i) => i.name),
+        stoves: profile?.stoves ?? [],
+        allergies: profile?.allergies ?? [],
+        taboos: profile?.taboos ?? [],
       });
-      const data = res.data?.data ?? {};
       setDishes(data.dishes ?? []);
       setAiOffline(!!data.aiOffline);
       if (data.aiOffline) {
@@ -115,7 +100,6 @@ export default function IndexPage() {
     }
     const selectedDishes = dishes.filter((d) => selected.includes(d.name));
     Taro.setStorageSync('cook_meal', {
-      openid,
       dinersCount: total,
       dishes: selectedDishes,
       stoves: profile?.stoves ?? [],

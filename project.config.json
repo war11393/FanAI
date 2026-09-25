@@ -1,10 +1,11 @@
 {
   "miniprogramRoot": "dist/",
+  "cloudfunctionRoot": "cloudfunctions/",
   "projectname": "today-eat-what",
-  "description": "test",
+  "description": "今天吃什么 - AI 家庭吃饭决策小程序（微信云开发版）",
   "appid": "wx152d76fdfc3ff517",
   "setting": {
-    "urlCheck": true,
+    "urlCheck": false,
     "es6": false,
     "enhance": false,
     "compileHotReLoad": false,

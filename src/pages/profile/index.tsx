@@ -7,21 +7,7 @@ import { Input } from '@/components/ui/input';
 import { Card, CardContent } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Minus, Plus, UserRound, Refrigerator, ChefHat, AlarmSmoke } from 'lucide-react-taro';
-import { Network } from '@/network';
-import { getOpenid } from '@/utils/identity';
-
-interface UserProfile {
-  [key: string]: unknown;
-  openid: string;
-  family_id?: string | null;
-  regular_members: number;
-  stoves: Array<{ type: string; count: number }>;
-  pots: string[];
-  allergies: string[];
-  taboos: string[];
-  flavors: string[];
-  voice_control_on: boolean;
-}
+import { getUserProfile, saveUserProfile, type UserProfile } from '@/cloud/api';
 
 const STOVE_OPTIONS = ['燃气灶', '电磁炉', '电陶炉', '烤箱', '空气炸锅'];
 const POT_OPTIONS = ['炒锅', '汤锅', '平底锅', '蒸锅', '砂锅', '高压锅'];
@@ -30,7 +16,6 @@ const QUICK_TABOOS = ['香菜', '葱', '大蒜', '内脏', '肥肉', '辣', '味
 const QUICK_FLAVORS = ['偏辣', '偏淡', '偏甜', '偏咸', '偏酸', '偏麻', '重口味', '清淡', '喜欢蒜香', '喜欢葱香', '开胃酸爽', '无辣不欢'];
 
 const ProfilePage = () => {
-  const openid = getOpenid();
   const [profile, setProfile] = useState<UserProfile | null>(null);
   const [allergyInput, setAllergyInput] = useState('');
   const [tabooInput, setTabooInput] = useState('');
@@ -39,14 +24,13 @@ const ProfilePage = () => {
 
   const loadProfile = useCallback(async () => {
     try {
-      const res = await Network.request({ url: `/api/users/${openid}` });
-      const d = (res.data as { data?: UserProfile }).data;
+      const d = await getUserProfile();
       console.log('[profile] load:', d);
       setProfile(d ?? null);
     } catch (e) {
       console.error('[profile] load error', e);
     }
-  }, [openid]);
+  }, []);
 
   useEffect(() => {
     loadProfile();
@@ -57,8 +41,8 @@ const ProfilePage = () => {
   };
 
   const stepMembers = (delta: number) => {
-    const base = profile?.regular_members ?? 2;
-    update({ regular_members: Math.max(1, Math.min(10, base + delta)) });
+    const base = profile?.regularMembers ?? 2;
+    update({ regularMembers: Math.max(1, Math.min(10, base + delta)) });
   };
 
   const toggleInList = (key: 'allergies' | 'taboos' | 'flavors', value: string) => {
@@ -104,23 +88,19 @@ const ProfilePage = () => {
     if (!profile) return;
     setSaving(true);
     try {
-      const res = await Network.request({
-        url: '/api/users/upsert',
-        method: 'POST',
-        data: {
-          openid,
-          regular_members: profile.regular_members,
-          stoves: profile.stoves,
-          pots: profile.pots,
-          allergies: profile.allergies,
-          taboos: profile.taboos,
-          flavors: profile.flavors,
-          voice_control_on: profile.voice_control_on,
-        },
+      const saved = await saveUserProfile({
+        regularMembers: profile.regularMembers,
+        stoves: profile.stoves,
+        pots: profile.pots,
+        allergies: profile.allergies,
+        taboos: profile.taboos,
+        flavors: profile.flavors,
+        voiceControlOn: profile.voiceControlOn,
       });
-      console.log('[profile] save res:', res.data);
+      console.log('[profile] save res:', saved);
+      setProfile(saved);
       // 语音开关单独持久化，供做菜阶段读取
-      Taro.setStorageSync('voice_control_on', !!profile.voice_control_on);
+      Taro.setStorageSync('voice_control_on', !!saved.voiceControlOn);
       Taro.showToast({ title: '已保存', icon: 'success' });
     } catch (e) {
       console.error('[profile] save error', e);
@@ -161,7 +141,7 @@ const ProfilePage = () => {
                 <Button size="icon" variant="outline" className="rounded-full h-10 w-10 border-[#FF8C42] bg-[#FFF3E0]" onClick={() => stepMembers(-1)}>
                   <Minus size={18} color="#FF8C42" />
                 </Button>
-                <Text className="block text-2xl font-bold text-[#3E3226] w-6 text-center">{profile.regular_members}</Text>
+                <Text className="block text-2xl font-bold text-[#3E3226] w-6 text-center">{profile.regularMembers}</Text>
                 <Button size="icon" variant="outline" className="rounded-full h-10 w-10 border-[#FF8C42] bg-[#FFF3E0]" onClick={() => stepMembers(1)}>
                   <Plus size={18} color="#FF8C42" />
                 </Button>
@@ -297,7 +277,7 @@ const ProfilePage = () => {
                 <Text className="block text-xs text-[#8B7D6E]">做菜时语音喊&ldquo;下一步&rdquo;并自动播报（小程序端）</Text>
               </View>
             </View>
-            <Switch checked={!!profile.voice_control_on} onCheckedChange={(v) => update({ voice_control_on: v })} />
+            <Switch checked={!!profile.voiceControlOn} onCheckedChange={(v) => update({ voiceControlOn: v })} />
           </CardContent>
         </Card>
 

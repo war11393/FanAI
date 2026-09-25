@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import Taro from '@tarojs/taro';
 import { View, Text } from '@tarojs/components';
-import { Network } from '@/network';
+import { aiPrep, aiCooking, saveMealPlan } from '@/cloud/api';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { Check, ChevronRight, PartyPopper, Mic } from 'lucide-react-taro';
@@ -42,12 +42,9 @@ export default function CookPage() {
   const generatePrep = async (dishList: Dish[], count: number) => {
     setGenerating(true);
     try {
-      const res: any = await Network.request({
-        url: '/api/ai/prep', method: 'POST',
-        data: { openid: Taro.getStorageSync('openid') || '', dinersCount: count, dishes: dishList },
-      });
-      const data = res.data?.data ?? {};
-      setPrepList((data.prepList ?? []).map((t: string) => ({ task: t, done: false })));
+      const data = await aiPrep({ dinersCount: count, dishes: dishList });
+      // ★ 修复：云函数返回的是 prep_list（原代码误读 prepList，导致备菜清单恒为空）
+      setPrepList((data.prep_list ?? []).map((it) => ({ task: it.task, done: false })));
     } catch (e) {
       console.error('[cook] prep error', e);
       setPrepList([]);
@@ -58,16 +55,20 @@ export default function CookPage() {
     setPhase('cooking');
     setStepIndex(0);
     try {
-      const res: any = await Network.request({
-        url: '/api/ai/cooking', method: 'POST',
-        data: { openid: Taro.getStorageSync('openid') || '', dinersCount: diners, dishes, stoves },
-      });
-      const data = res.data?.data ?? {};
-      setSteps(data.steps ?? []);
-      speak(textForStep(0));
+      const data = await aiCooking({ dinersCount: diners, dishes, stoves });
+      // ★ 云函数返回 steps 的字段是 dish/instruction，映射为本页的 title/content
+      const mapped: CookStep[] = (data.steps ?? []).map((s) => ({
+        title: s.dish,
+        content: s.instruction,
+        minutes: undefined,
+        stove: s.tips,
+      }));
+      setSteps(mapped);
+      speak(textForStep(0, mapped));
     } catch (e) {
       console.error('[cook] cooking error', e);
-      setSteps([{ title: '先热锅', content: '热锅凉油，准备开始烹饪。' }]);
+      const fallback: CookStep[] = [{ title: '先热锅', content: '热锅凉油，准备开始烹饪。' }];
+      setSteps(fallback);
       speak('先热锅，热锅凉油。');
     }
   };
@@ -77,8 +78,8 @@ export default function CookPage() {
   };
   const allDone = prepList.length > 0 && prepList.every((it) => it.done);
 
-  const textForStep = (i: number) => {
-    const step = steps[i];
+  const textForStep = (i: number, list?: CookStep[]) => {
+    const step = (list ?? steps)[i];
     return step ? `${step.title}，${step.content}` : '';
   };
 
@@ -92,16 +93,18 @@ export default function CookPage() {
   // 出餐时将本次进餐写入历史（供菜谱页展示）
   const saveDone = async () => {
     try {
-      await Network.request({
-        url: '/api/meal-plans/save', method: 'POST',
-        data: {
-          openid: Taro.getStorageSync('openid') || '',
-          diners_count: diners,
-          selected_dishes: dishes.map((d) => ({ name: d.name, duration_minutes: d.duration_minutes })),
-          prep_list: prepList.map((p) => p.task),
-          cooking_steps: steps,
-          status: 'done',
-        },
+      await saveMealPlan({
+        date: new Date().toISOString().slice(0, 10),
+        dinersCount: diners,
+        selectedDishes: dishes.map((d) => ({ name: d.name })),
+        prepList: prepList.map((p) => ({ task: p.task, dish: '', minutes: 0, done: p.done })),
+        cookingSteps: steps.map((s, i) => ({
+          seq: i + 1,
+          dish: s.title,
+          instruction: s.content,
+          tips: s.stove,
+        })),
+        status: 'done',
       });
     } catch (e) {
       console.error('[cook] save history error', e);

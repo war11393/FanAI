@@ -23,7 +23,6 @@ const path = require('path');
 const { execSync } = require('child_process');
 
 const ROOT = path.resolve(__dirname, '..');
-const CLI = 'C:\\Program Files (x86)\\Tencent\\微信web开发者工具\\cli.bat';
 // 与 src/cloud/config.ts 的 CLOUD_ENV_ID 保持一致
 const ENV_ID = 'war11393-d3ghsd3zcc6dd0426';
 const FN_NAME = 'recipe-sync';
@@ -50,26 +49,16 @@ try {
   process.exit(1);
 }
 
-/* 4. 通过开发者工具 CLI 部署云函数 */
+/* 4. 通过开发者工具 CLI 部署云函数（复用 scripts/deploy-cloudfunctions.js 的部署+核对逻辑） */
 console.log(`\n[deploy] 部署云函数 ${FN_NAME} 到环境 ${ENV_ID} …`);
-// 云侧对新创建/刚更新的函数有短暂「Creating 状态」互斥窗口，报
-// FailedOperation.UpdateFunctionCode 时等待重试即可（实测 ~20s 后成功）
-const deployCmd = `"${CLI}" cloud functions deploy --env ${ENV_ID} --names ${FN_NAME} --remote-npm-install --project "${ROOT}"`;
-let deployed = false;
-for (let attempt = 1; attempt <= 4 && !deployed; attempt++) {
-  try {
-    run(deployCmd);
-    deployed = true;
-  } catch (e) {
-    if (attempt < 4) {
-      console.log(`[deploy] 第 ${attempt} 次部署失败（多为函数处于 Creating 状态的瞬时冲突），20s 后重试…`);
-      execSync('ping -n 21 127.0.0.1 >nul', { shell: 'cmd.exe', stdio: 'ignore' });
-      continue;
-    }
-    console.error('[deploy] CLI 部署失败。常见原因：开发者工具未打开或未开启服务端口。');
-    console.error('        可改为手动部署：开发者工具右键 cloudfunctions/recipe-sync → 上传并部署（云端安装依赖）');
-    process.exit(1);
-  }
+// 该脚本内部已处理：逐个部署、Creating 状态退避重试、部署后下载云端代码逐字核对。
+// ★ 只跑部署+核对，不再重复 fetch/sync-shared/离线自检（上面已做过）。
+try {
+  run(`node scripts/deploy-cloudfunctions.js ${FN_NAME}`);
+} catch {
+  console.error('[deploy] 云函数部署或核对失败，详见上方输出。');
+  console.error(`        可改为手动部署：开发者工具右键 cloudfunctions/${FN_NAME} → 上传并部署（云端安装依赖）`);
+  process.exit(1);
 }
 
 /* 5. 给出云端测试直达链接（CLI 无 invoke 能力，触发同步的 payload 已备好） */

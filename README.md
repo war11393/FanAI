@@ -94,7 +94,66 @@ pnpm build       # lint + tsc + web/weapp/tt/server 全量构建
 pnpm validate    # 仅 lint + 类型检查
 ```
 
-## 🤖 AI Provider 切换
+## ☁️ 微信云开发部署（必读）
+
+本项目前端**不直连数据库**，全部经云函数中转。首次跑起来必须完成以下三步，
+否则启动时会看到 `cloud.callFunction:fail ... FUNCTION_NOT_FOUND (-501000)`。
+
+### 1. 部署云函数
+
+```bash
+node scripts/deploy-cloudfunctions.js            # 部署全部 7 个云函数
+node scripts/deploy-cloudfunctions.js user recipe   # 只部署指定函数
+node scripts/deploy-cloudfunctions.js --verify-only # 只核对云端现状
+```
+
+| 云函数 | 作用 |
+| --- | --- |
+| `user` | 用户档案读写（家庭人数 / 灶具 / 过敏忌口 / 口味） |
+| `ingredient` | 冰箱食材 CRUD 与新鲜度状态机 |
+| `recipe` | 菜谱库 + 就餐记录（备菜清单 / 烹饪步骤） |
+| `ai-text` | 文本与视觉 AI（推荐 / 识别 / 解析 / 备菜 / 烹饪） |
+| `ai-image` | 菜谱成品图生成（混元 HY-Image） |
+| `db-init` | 数据库集合初始化（一次性） |
+| `recipe-sync` | 开源菜谱库同步（HowToCook） |
+
+> `ai-service` 目录是「方案 B」的后端桥接骨架，前端不调用，**无需部署**。
+
+**部署后自动核对**：脚本会下载云端代码与本地逐字比对并校验依赖。
+★ CLI 返回 `success` 只代表请求被接受，**不代表云端跑的是这份代码**——
+只有逐字比对通过才算部署完成。
+
+### 2. 初始化数据库集合（一次性）
+
+```bash
+# 另开一个终端，保持运行（连上开发者工具的自动化端口）
+node scripts/devtools-auto.js
+
+# 再开一个终端：建集合 + 灌入内置菜谱种子
+node scripts/init-database.js --seed
+node scripts/db:status          # 查看集合状态
+```
+
+建的是 4 个集合：`users` / `ingredients` / `meal_plans` / `recipes`。
+
+> **索引与权限必须在控制台手动设置**（云开发 Node SDK 无法建索引）：
+> - 权限：4 个集合均设为「**仅管理端可读写**」
+> - 索引：见 `node scripts/init-database.js --status` 反馈的 `suggestedIndexes`
+>
+> 索引数据量小时可暂缓；**权限必须设**，否则前端可绕过云函数直读全量数据。
+
+### 3. AI 能力配置（可选）
+
+`ai-text` / `ai-image` 默认走云开发自带的混元模型（`AI_PROVIDER=cloudbase`），
+需在云开发控制台开启 AI 能力。也可切到外部 OpenAI 兼容接口：
+云函数「配置 → 环境变量」设 `AI_PROVIDER=http` 及
+`AI_HTTP_BASE_URL` / `AI_HTTP_API_KEY` / `AI_HTTP_MODEL`。
+
+AI 不可用时云函数返回本地规则兜底数据（`aiOffline=true`），核心流程不中断。
+
+---
+
+## 🤖 AI Provider 切换（后端 NestJS 版本）
 
 后端通过 `AI_PROVIDER` 环境变量选择大模型来源，上层代码零改动：
 

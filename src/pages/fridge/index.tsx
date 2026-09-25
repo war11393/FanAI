@@ -1,8 +1,15 @@
 import { useEffect, useState, useCallback } from 'react';
 import Taro from '@tarojs/taro';
 import { View, Text, ScrollView } from '@tarojs/components';
-import { Network } from '@/network';
-import { getOpenid } from '@/utils/identity';
+import {
+  listIngredients,
+  aiParseText,
+  aiRecognizePhoto,
+  batchAddIngredients,
+  removeIngredient as removeIngredientApi,
+  uploadIngredientPhoto,
+  type Ingredient,
+} from '@/cloud/api';
 import { remainingDays } from '@/utils/shelf-life';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -11,18 +18,6 @@ import { Badge } from '@/components/ui/badge';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog';
 import { Camera, Mic, PencilLine, Plus } from 'lucide-react-taro';
 
-interface Ingredient {
-  id: string;
-  name: string;
-  icon?: string;
-  quantity: number;
-  unit: string;
-  add_time: string;
-  expire_time: string;
-  status: 'fresh' | 'expiring' | 'expired';
-  source: 'photo' | 'voice' | 'text';
-}
-
 const STATUS_LABEL: Record<string, { text: string; color: string; chip: string }> = {
   fresh: { text: '新鲜', color: '#4CAF50', chip: 'bg-[#E8F5E9] text-[#4CAF50]' },
   expiring: { text: '临期', color: '#FFC107', chip: 'bg-[#FFF8E1] text-[#E6A700]' },
@@ -30,7 +25,6 @@ const STATUS_LABEL: Record<string, { text: string; color: string; chip: string }
 };
 
 export default function FridgePage() {
-  const openid = getOpenid();
   const [list, setList] = useState<Ingredient[]>([]);
   const [loading, setLoading] = useState(true);
   const [filter, setFilter] = useState<'all' | 'fresh' | 'expiring' | 'expired'>('all');
@@ -68,15 +62,15 @@ export default function FridgePage() {
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      const res: any = await Network.request({ url: `/api/ingredients?openid=${openid}` });
-      const data = res.data?.data ?? [];
-      setList(data);
+      // ★ openid 由云函数从微信上下文获取
+      const data = await listIngredients();
+      setList(data.list ?? []);
     } catch (e) {
       console.error('[fridge] load error', e);
     } finally {
       setLoading(false);
     }
-  }, [openid]);
+  }, []);
 
   const visible = filter === 'all' ? list : list.filter((it) => it.status === filter);
 
@@ -85,19 +79,20 @@ export default function FridgePage() {
     setSaving(true);
     try {
       // 先调用 AI 解析（失败会返回本地兜底）
-      const parseRes: any = await Network.request({
-        url: '/api/ai/parse', method: 'POST',
-        data: { openid, text: textVal },
-      });
-      const items = parseRes.data?.data ?? [];
+      const parseData = await aiParseText(textVal);
+      const items = parseData.items ?? [];
       if (items.length === 0) {
         Taro.showToast({ title: '未能识别食材，请描述更清晰', icon: 'none' });
         return;
       }
-      await Network.request({
-        url: '/api/ingredients/batch', method: 'POST',
-        data: { openid, items: items.map((it: any) => ({ name: it.name, quantity: it.quantity, unit: it.unit, source: 'text' })) },
-      });
+      await batchAddIngredients(
+        items.map((it) => ({
+          name: it.name,
+          quantity: it.quantity,
+          unit: it.unit,
+          source: 'text' as const,
+        })),
+      );
       Taro.showToast({ title: `已录入 ${items.length} 种食材`, icon: 'success' });
       setTextVal('');
       setTextOpen(false);
@@ -110,27 +105,30 @@ export default function FridgePage() {
     }
   };
 
+  /** 拍照 -> 上传云存储 -> 视觉识别 -> 批量入库 */
   const handlePickPhoto = async () => {
     try {
       const res = await Taro.chooseImage({ count: 1 });
       const filePath = res.tempFilePaths[0];
       Taro.showLoading({ title: '识别中...' });
-      const uploadRes: any = await Network.uploadFile({
-        url: '/api/ingredients/recognize-photo',
-        filePath,
-        name: 'file',
-        formData: { openid },
-      });
+      // ★ 替代原 Network.uploadFile：先传云存储拿 fileID，再把 fileID 交给视觉模型
+      const fileID = await uploadIngredientPhoto(filePath);
+      const recognizeData = await aiRecognizePhoto(fileID);
       Taro.hideLoading();
-      const items = uploadRes.data?.data?.items ?? [];
+      const items = recognizeData.items ?? [];
       if (items.length === 0) {
         Taro.showToast({ title: '未识别出食材，请换张清晰照片', icon: 'none' });
         return;
       }
-      await Network.request({
-        url: '/api/ingredients/batch', method: 'POST',
-        data: { openid, items: items.map((it: any) => ({ name: it.name, quantity: it.quantity, unit: it.unit, shelfLifeDays: it.shelfLifeDays, source: 'photo' })) },
-      });
+      await batchAddIngredients(
+        items.map((it) => ({
+          name: it.name,
+          quantity: it.quantity,
+          unit: it.unit,
+          shelfLifeDays: it.shelfLifeDays,
+          source: 'photo' as const,
+        })),
+      );
       Taro.showToast({ title: `已录入 ${items.length} 种食材`, icon: 'success' });
       load();
     } catch (e) {
@@ -140,27 +138,31 @@ export default function FridgePage() {
     }
   };
 
+  /**
+   * 语音录入
+   * ★ 本环境未接入微信同声传译（需企业主体开通插件），
+   *   因此语音文件同样走视觉模型的「识别」通道做兜底。
+   *   完整语音转文字方案见 app.config.ts 中 plugins 的预留位说明。
+   */
   const parseVoice = async (filePath: string) => {
     Taro.showLoading({ title: '识别中...' });
     try {
-      // 把时长较短的语音传给后端解析（此处用记录时长提示，直接走文本占位：语音内容转为文本）
-      // 本环境未接入微信同声传译，先通过通用 ASR 简化：将语音文件上传后由后端解析成文本
-      const uploadRes: any = await Network.uploadFile({
-        url: '/api/ingredients/recognize-photo',
-        filePath,
-        name: 'file',
-        formData: { openid },
-      });
+      const fileID = await uploadIngredientPhoto(filePath);
+      const recognizeData = await aiRecognizePhoto(fileID);
       Taro.hideLoading();
-      const items = uploadRes.data?.data?.items ?? [];
+      const items = recognizeData.items ?? [];
       if (items.length === 0) {
         Taro.showToast({ title: '未识别出食材，可改用文本输入', icon: 'none' });
         return;
       }
-      await Network.request({
-        url: '/api/ingredients/batch', method: 'POST',
-        data: { openid, items: items.map((it: any) => ({ name: it.name, quantity: it.quantity, unit: it.unit, source: 'voice' })) },
-      });
+      await batchAddIngredients(
+        items.map((it) => ({
+          name: it.name,
+          quantity: it.quantity,
+          unit: it.unit,
+          source: 'voice' as const,
+        })),
+      );
       Taro.showToast({ title: '语音录入成功', icon: 'success' });
       load();
     } catch (e) {
@@ -179,11 +181,11 @@ export default function FridgePage() {
   };
   const stopRecord = () => recorder?.stop();
 
-  const removeIngredient = async (id: string) => {
+  const handleRemoveIngredient = async (id: string) => {
     const ok = await Taro.showModal({ title: '提示', content: '确定要删除该食材吗？', confirmText: '删除' });
     if (!ok.confirm) return;
     try {
-      await Network.request({ url: `/api/ingredients/${id}?openid=${openid}`, method: 'DELETE' });
+      await removeIngredientApi(id);
       load();
     } catch (e) {
       console.error(e);
@@ -230,9 +232,9 @@ export default function FridgePage() {
           ) : (
             visible.map((it) => {
               const st = STATUS_LABEL[it.status] || STATUS_LABEL.fresh;
-              const days = remainingDays(it.expire_time);
+              const days = remainingDays(it.expireTime);
               return (
-                <Card key={it.id} className="mb-3 bg-white rounded-2xl border border-gray-100 shadow-sm">
+                <Card key={it._id} className="mb-3 bg-white rounded-2xl border border-gray-100 shadow-sm">
                   <CardContent className="p-4">
                     <View className="flex flex-row items-center justify-between">
                       <View className="flex-1">
@@ -248,7 +250,7 @@ export default function FridgePage() {
                         </Text>
                       </View>
                       <View className="ml-3">
-                        <Button size="sm" variant="ghost" onClick={() => removeIngredient(it.id)}>
+                        <Button size="sm" variant="ghost" onClick={() => handleRemoveIngredient(it._id)}>
                           <Text className="text-gray-400">删除</Text>
                         </Button>
                       </View>

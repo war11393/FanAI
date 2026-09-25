@@ -1,8 +1,14 @@
 import { useCallback, useEffect, useState } from 'react';
 import Taro from '@tarojs/taro';
 import { View, Text, ScrollView } from '@tarojs/components';
-import { Network } from '@/network';
-import { getOpenid } from '@/utils/identity';
+import {
+  listRecipes,
+  listMealPlans,
+  createRecipe as createRecipeApi,
+  removeRecipe,
+  type Recipe,
+  type MealPlan,
+} from '@/cloud/api';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Textarea } from '@/components/ui/textarea';
@@ -12,30 +18,9 @@ import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog';
 import { Search, BookOpen, Plus, Mic, Clock, ChefHat, Trash2, FileText } from 'lucide-react-taro';
 
-interface Recipe {
-  id?: string;
-  openid?: string | null;
-  name: string;
-  category?: string;
-  flavors?: string[];
-  ingredients?: string[];
-  main_steps?: string[];
-  brief?: string;
-  difficulty?: string;
-  duration_minutes?: number;
-  source?: string;
-}
-interface MealHistory {
-  id: string;
-  date: string;
-  diners_count: number;
-  selected_dishes: Array<{ name: string; [k: string]: unknown }>;
-  status: string;
-  created_at?: string;
-}
+type MealHistory = MealPlan;
 
 export default function RecipesPage() {
-  const openid = getOpenid();
   // 菜谱浏览
   const [recipes, setRecipes] = useState<Recipe[]>([]);
   const [keyword, setKeyword] = useState('');
@@ -53,26 +38,24 @@ export default function RecipesPage() {
   const loadRecipes = useCallback(async (kw?: string) => {
     setLoading(true);
     try {
-      const res: any = await Network.request({
-        url: `/api/recipes?openid=${openid}${kw ? `&keyword=${encodeURIComponent(kw)}` : ''}`,
-      });
-      setRecipes(res.data?.data ?? []);
+      const data = await listRecipes(kw);
+      setRecipes(data.list ?? []);
     } catch (e) {
       console.error('[recipes] load error', e);
       Taro.showToast({ title: '菜谱加载失败', icon: 'none' });
     } finally {
       setLoading(false);
     }
-  }, [openid]);
+  }, []);
 
   const loadHistory = useCallback(async () => {
     try {
-      const res: any = await Network.request({ url: `/api/meal-plans?openid=${openid}&status=done` });
-      setHistory(res.data?.data ?? []);
+      const data = await listMealPlans('done');
+      setHistory(data.list ?? []);
     } catch (e) {
       console.error('[history] load error', e);
     }
-  }, [openid]);
+  }, []);
 
   useEffect(() => {
     loadRecipes();
@@ -81,6 +64,11 @@ export default function RecipesPage() {
 
   const onSearch = () => loadRecipes(keyword);
 
+  /**
+   * 从自然语言文本创建私人菜谱
+   * ★ 云函数无「文本转菜谱」能力，改为直接落库 + 保留原文到 brief，
+   *   后续如需 AI 结构化，可扩展 ai-text 云函数的 'recipeFromText' action。
+   */
   const createRecipe = async () => {
     if (!text.trim()) {
       Taro.showToast({ title: '请输入菜谱内容', icon: 'none' });
@@ -88,11 +76,19 @@ export default function RecipesPage() {
     }
     setSaving(true);
     try {
-      const res: any = await Network.request({
-        url: '/api/recipes/from-text', method: 'POST',
-        data: { openid, text },
+      // 首行作为菜名，其余内容作为步骤
+      const lines = text
+        .split('\n')
+        .map((l) => l.trim())
+        .filter(Boolean);
+      const name = (lines[0] || '我的菜谱').slice(0, 30);
+      const rest = lines.slice(1);
+      const created = await createRecipeApi({
+        name,
+        brief: rest[0] || text.slice(0, 80),
+        mainSteps: rest.length ? rest : [text.trim()],
+        source: 'user',
       });
-      const created = res.data?.data;
       if (created?.name) Taro.showToast({ title: '已保存私人菜谱', icon: 'success' });
       setText('');
       setCreateOpen(false);
@@ -105,9 +101,9 @@ export default function RecipesPage() {
     }
   };
 
-  const deleteRecipe = async (id: string) => {
+  const handleDeleteRecipe = async (id: string) => {
     try {
-      await Network.request({ url: `/api/recipes/${id}?openid=${openid}`, method: 'DELETE' });
+      await removeRecipe(id);
       Taro.showToast({ title: '已删除', icon: 'success' });
       loadRecipes();
     } catch (e) {
@@ -177,7 +173,7 @@ export default function RecipesPage() {
             )}
 
             {recipes.map((r, i) => {
-              const key = r.id || `${r.name}-${i}`;
+              const key = r._id || `${r.name}-${i}`;
               const open = expanded === key;
               const isPrivate = r.source === 'private';
               return (
@@ -191,9 +187,9 @@ export default function RecipesPage() {
                     </View>
                     {r.brief ? <Text className="block text-xs text-[#8B7D6E] mb-2">{r.brief}</Text> : null}
                     <View className="flex flex-row flex-wrap gap-1.5 mb-2">
-                      {r.duration_minutes ? (
+                      {r.durationMinutes ? (
                         <Badge variant="outline" className="bg-[#FFFDF8] border-[#F0E2D0] text-[#8B7D6E]">
-                          <Clock size={12} color="#c76a2a" className="mr-1" />{r.duration_minutes}分
+                          <Clock size={12} color="#c76a2a" className="mr-1" />{r.durationMinutes}分
                         </Badge>
                       ) : null}
                       {r.difficulty ? (
@@ -210,7 +206,7 @@ export default function RecipesPage() {
                     {open ? (
                       <View className="mt-2 space-y-1">
                         <Text className="block text-xs font-semibold text-[#3E3226]">做法：</Text>
-                        {(r.main_steps ?? []).map((s, si) => (
+                        {(r.mainSteps ?? []).map((s, si) => (
                           <Text key={si} className="block text-xs text-[#5B5349]">{si + 1}. {s}</Text>
                         ))}
                       </View>
@@ -220,8 +216,8 @@ export default function RecipesPage() {
                       <Button size="sm" variant="outline" className="flex-1 rounded-full border-[#F0E2D0] text-[#8B7D6E]" onClick={() => setExpanded(open ? null : key)}>
                         {open ? '收起做法' : '查看做法'}
                       </Button>
-                      {isPrivate && r.id && (
-                        <Button size="sm" variant="outline" className="rounded-full border-[#F44336] text-[#F44336]" onClick={() => deleteRecipe(r.id!)}>
+                      {isPrivate && r._id && (
+                        <Button size="sm" variant="outline" className="rounded-full border-[#F44336] text-[#F44336]" onClick={() => handleDeleteRecipe(r._id)}>
                           <Trash2 size={14} color="#F44336" />
                         </Button>
                       )}
@@ -238,14 +234,14 @@ export default function RecipesPage() {
               <Text className="block text-center text-sm text-[#8B7D6E] py-10">还没有完成过做菜，去首页试试「今天吃什么」吧</Text>
             )}
             {history.map((h) => (
-              <Card key={h.id} className="rounded-3xl border-0 shadow-sm bg-white overflow-hidden">
+              <Card key={h._id} className="rounded-3xl border-0 shadow-sm bg-white overflow-hidden">
                 <View className="bg-[#FF8C42] px-4 py-2 flex flex-row items-center justify-between">
                   <Text className="block text-xs font-bold text-white">{h.date}</Text>
-                  <Text className="block text-xs text-orange-100">{h.diners_count} 人 · 已出餐 🎉</Text>
+                  <Text className="block text-xs text-orange-100">{h.dinersCount} 人 · 已出餐 🎉</Text>
                 </View>
                 <CardContent className="p-4">
                   <Text className="block text-sm font-bold text-[#3E3226] mb-2">今日菜单</Text>
-                  {(h.selected_dishes ?? []).map((d, i) => (
+                  {(h.selectedDishes ?? []).map((d, i) => (
                     <View key={i} className="flex flex-row items-center gap-2 py-1">
                       <View className="w-2 h-2 rounded-full bg-[#FF8C42]" />
                       <Text className="block text-sm text-[#5B5349]">{d.name}</Text>
