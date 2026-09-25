@@ -1,6 +1,6 @@
 {
   "name": "today-eat-what",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "private": true,
   "description": "今天吃什么 - AI 驱动的家庭吃饭决策小程序（Taro + NestJS）",
   "scripts": {

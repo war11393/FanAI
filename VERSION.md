@@ -21,6 +21,33 @@
   - 项目更名 `today-eat-what`，新增 `.env.example` 配置模板
 - ⚠️ 状态：本地构建与自检通过；微信小程序真机/正式环境未验证
 
+### v1.0.1 — 2026-09-25（云开发链路打通）
+
+- 🐛 **修复启动即报 `-501000 FUNCTION_NOT_FOUND`**：
+  - 根因不是本地化未完成，而是云端只部署了 `db-init` / `recipe-sync` 两个云函数，
+    首页启动调用的 `user` / `ingredient` 缺失
+  - 补齐部署 5 个云函数（`user` / `ingredient` / `recipe` / `ai-text` / `ai-image`），
+    云端现有 7 个
+- 🔒 页面层从 `Network.request` + `getOpenid` 迁移到 `@/cloud` 云开发调用层：
+  openid 改由云函数从 `getWXContext()` 取，前端不再传入，堵死伪造路径
+- 🛠 新增部署工具链（修复三个 Windows/CLI 坑）：
+  - `scripts/deploy-cloudfunctions.js`：CLI 的 `--names` 只接受单个函数名
+    （逗号分隔报 `cloudfunction path not found`）；Creating 状态自动退避重试；
+    **部署后下载云端代码逐字核对** —— CLI 返回 `success` 只代表请求被接受，
+    不代表云端跑的是这份代码
+  - `scripts/init-database.js` + `scripts/devtools-auto.js`：经 CLI 自动化端口
+    真实调用 `db-init`，绕开 `cli.bat` 在 git-bash 下不可用
+  - `scripts/deploy-recipes.js` 改为复用上述脚本，顺带获得源码核对能力
+  - `project.config.json` 补 `cloudfunctionRoot`；README 补「微信云开发部署」整节
+- ✅ **已验证**（2026-09-25）：
+  - 7 个云函数云端源码与本地逐字一致、依赖齐备
+  - `node cloudfunctions/test-offline.js` 48 项全过、`pnpm validate` 全绿
+  - 开发者工具模拟器实跑：启动报错消失，首页正常渲染
+    （人数区「2 人」= `user` 返回、冰箱区空态文案 = `ingredient` 返回）
+- ⚠️ **仍未验证**：正式环境 / 真机（非模拟器）未跑过；
+  4 个集合权限待由「仅创建者可读写」收紧至「所有用户不可读写」
+  （安全加固，不阻断功能 —— 云函数走管理端身份不受限）
+
 ## 发布流程（建议）
 
 1. 更新 `package.json` / `server/package.json` 的 `version`
